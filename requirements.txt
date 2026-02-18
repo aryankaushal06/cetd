@@ -1,0 +1,14 @@
+streamlit
+xarray
+netCDF4
+h5netcdf
+numpy
+pandas
+matplotlib
+dask
+geodatasets
+geopandas
+shapely
+pyproj
+fiona
+matplotlib>=3.7

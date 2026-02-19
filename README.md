@@ -76,8 +76,9 @@ Onset definition uses:
 - Ethiopia clipped grid
 - consistent rainfall legend
 
-#### (Upcoming)
-- per-pixel onset DOY map using JJAS custom colormap
+#### Median wet spell & onset date (DOY) over year range
+- multi-year range
+- Ethiopia clipped grid
 
 ---
 

@@ -447,6 +447,95 @@ def compute_median_doy_maps(
     return lat_vals, lon_vals, median_wet, median_onset
 
 
+@st.cache_data(show_spinner=True)
+def compute_single_year_doy_maps(
+    ds_path_list: List[str],
+    var: str,
+    lat_name: str,
+    lon_name: str,
+    time_name: str,
+    year: int,
+    wet_day_mm: float,
+    accum_days: int,
+    accum_mm: float,
+    dry_spell_days: int,
+    lookahead_days: int,
+    start_month: int,
+    start_day: int,
+    end_month: int,
+    end_day: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns:
+      lat_vals, lon_vals, wetspell_doy(lat,lon), onset_doy(lat,lon)
+    for ONE year only (no median).
+    """
+
+    ds = xr.open_mfdataset(
+        ds_path_list,
+        combine="by_coords",
+        parallel=True,
+        chunks={"time": 365},
+        engine=None,
+    )
+    ds = maybe_normalize_longitudes(ds, lon_name)
+
+    da_y = ds[var].sel({time_name: slice(f"{year}-01-01", f"{year}-12-31")}).compute()
+
+    lat_vals = da_y[lat_name].values
+    lon_vals = da_y[lon_name].values
+
+    R = da_y.values  # (time, lat, lon)
+    times = pd.to_datetime(da_y[time_name].values)
+
+    wet_map = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=float)
+    onset_map = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=float)
+
+    # pixel loop
+    for i in range(R.shape[1]):
+        for j in range(R.shape[2]):
+            rain_ij = R[:, i, j]
+
+            # wet spell candidate (accum only)
+            wet_cand_date, wet_cand_idx = detect_first_wet_spell(
+                dates=pd.Series(times),
+                rain=rain_ij,
+                accum_days=int(accum_days),
+                accum_mm=float(accum_mm),
+                start_month=int(start_month),
+                start_day=int(start_day),
+                end_month=int(end_month),
+                end_day=int(end_day),
+            )
+            wet_start = wet_spell_start_from_idx(
+                dates=pd.Series(times),
+                rain=rain_ij,
+                idx=wet_cand_idx,
+                wet_day_mm=float(wet_day_mm),
+            )
+            if wet_start is not None:
+                wet_map[i, j] = float(pd.Timestamp(wet_start).dayofyear)
+
+            # onset (accum + dry spell)
+            onset_date, _ = detect_onset(
+                dates=pd.Series(times),
+                rain=rain_ij,
+                wet_day_mm=float(wet_day_mm),
+                accum_days=int(accum_days),
+                accum_mm=float(accum_mm),
+                dry_spell_days=int(dry_spell_days),
+                lookahead_days=int(lookahead_days),
+                start_month=int(start_month),
+                start_day=int(start_day),
+                end_month=int(end_month),
+                end_day=int(end_day),
+            )
+            if onset_date is not None:
+                onset_map[i, j] = float(pd.Timestamp(onset_date).dayofyear)
+
+    return lat_vals, lon_vals, wet_map, onset_map
+
+
 # -----------------------------
 # Streamlit App
 # -----------------------------
@@ -579,6 +668,61 @@ end_day = st.sidebar.number_input(
 if mode == "Map (Ethiopia)":
     st.subheader("Map view options")
 
+    # --- FIRST option under map view options ---
+    year_mode = st.radio(
+        "Year selection",
+        ["Single year", "Year range"],
+        horizontal=True,
+        key="year_mode",
+    )
+
+    # --- Choose map type AFTER year selection ---
+    map_kind = st.radio(
+        "Map type",
+        [
+            "Seasonal mean rainfall (JJAS)",
+            "Daily rainfall map (selected date)",
+            "Wet spell date (DOY)",
+            "Onset date (DOY)",
+        ],
+        horizontal=True,
+        key="map_kind",
+    )
+
+    # --- Year UI depends ONLY on year_mode ---
+    if year_mode == "Single year":
+        y0 = y1 = int(
+            st.selectbox(
+                "Year",
+                options=year_list,
+                index=year_list.index(year),
+                key="map_year_single",
+            )
+        )
+    else:
+        cA, cB = st.columns([1, 1])
+        with cA:
+            y0 = int(
+                st.selectbox(
+                    "Start year",
+                    options=year_list,
+                    index=0,
+                    key="map_year_start",
+                )
+            )
+        with cB:
+            y1 = int(
+                st.selectbox(
+                    "End year",
+                    options=year_list,
+                    index=len(year_list) - 1,
+                    key="map_year_end",
+                )
+            )
+        if y1 < y0:
+            st.error("End year must be ≥ start year.")
+            st.stop()
+            
     map_kind = st.radio(
         "Map type",
         [
@@ -594,19 +738,6 @@ if mode == "Map (Ethiopia)":
     eth_geom = eth.geometry.iloc[0]
     eth_bounds = eth.total_bounds
     eth_lon_min, eth_lat_min, eth_lon_max, eth_lat_max = map(float, eth_bounds)
-
-    # Shared year-range controls for year-range maps
-    if "year range" in map_kind:
-        cA, cB = st.columns([1, 1])
-        with cA:
-            y0 = st.selectbox("Start year", options=year_list, index=0, key="y0_map")
-        with cB:
-            y1 = st.selectbox(
-                "End year", options=year_list, index=len(year_list) - 1, key="y1_map"
-            )
-        if y1 < y0:
-            st.error("End year must be ≥ start year.")
-            st.stop()
 
     if map_kind == "Seasonal mean rainfall (JJAS) over year range":
         da_season = ds[var].sel({time_name: slice(f"{y0}-01-01", f"{y1}-12-31")})
@@ -681,43 +812,95 @@ if mode == "Map (Ethiopia)":
         st.pyplot(fig)
 
     else:
-        # Median DOY maps (wet spell / onset) over year range using JJAS piecewise cmap
+        # DOY maps (wet spell / onset)
         cmap_jjas, norm_jjas, tick_positions, tick_labels = build_jjas_doy_cmap()
 
-        lat_vals, lon_vals, med_wet_doy, med_onset_doy = compute_median_doy_maps(
-            ds_path_list=[str(f) for f in files],
-            var=var,
-            lat_name=lat_name,
-            lon_name=lon_name,
-            time_name=time_name,
-            y0=int(y0),
-            y1=int(y1),
-            wet_day_mm=float(wet_day_mm),
-            accum_days=int(accum_days),
-            accum_mm=float(accum_mm),
-            dry_spell_days=int(dry_spell_days),
-            lookahead_days=int(lookahead_days),
-            start_month=int(start_month),
-            start_day=int(start_day),
-            end_month=int(end_month),
-            end_day=int(end_day),
-        )
+        if year_mode == "Single year":
 
-        mask = make_inside_mask(lat_vals, lon_vals, eth_geom)
+            lat_vals, lon_vals, wet_doy, onset_doy = compute_single_year_doy_maps(
+                ds_path_list=[str(f) for f in files],
+                var=var,
+                lat_name=lat_name,
+                lon_name=lon_name,
+                time_name=time_name,
+                year=int(y0),
+                wet_day_mm=float(wet_day_mm),
+                accum_days=int(accum_days),
+                accum_mm=float(accum_mm),
+                dry_spell_days=int(dry_spell_days),
+                lookahead_days=int(lookahead_days),
+                start_month=int(start_month),
+                start_day=int(start_day),
+                end_month=int(end_month),
+                end_day=int(end_day),
+            )
 
-        if map_kind == "Median wet spell date (DOY) over year range":
-            Z = np.where(mask, med_wet_doy, np.nan)
-            title = f"Median first wet spell date (DOY) — {y0}–{y1}"
-            cb_label = "Median Wet Spell DOY"
+            wet_doy = np.rint(wet_doy)
+            onset_doy = np.rint(onset_doy)
+
+            if map_kind == "Median wet spell date (DOY) over year range":
+                Z = wet_doy
+                title = f"Wet spell date (DOY) — {y0}"
+                cb_label = "Wet Spell DOY"
+            else:
+                Z = onset_doy
+                title = f"Onset date (DOY) — {y0}"
+                cb_label = "Onset DOY"
+
         else:
-            Z = np.where(mask, med_onset_doy, np.nan)
-            title = f"Median onset date (DOY) — {y0}–{y1}"
-            cb_label = "Median Onset DOY"
+            lat_vals, lon_vals, med_wet_doy, med_onset_doy = compute_median_doy_maps(
+                ds_path_list=[str(f) for f in files],
+                var=var,
+                lat_name=lat_name,
+                lon_name=lon_name,
+                time_name=time_name,
+                y0=int(y0),
+                y1=int(y1),
+                wet_day_mm=float(wet_day_mm),
+                accum_days=int(accum_days),
+                accum_mm=float(accum_mm),
+                dry_spell_days=int(dry_spell_days),
+                lookahead_days=int(lookahead_days),
+                start_month=int(start_month),
+                start_day=int(start_day),
+                end_month=int(end_month),
+                end_day=int(end_day),
+            )
+
+            med_wet_doy = np.rint(med_wet_doy)
+            med_onset_doy = np.rint(med_onset_doy)
+
+            if map_kind == "Median wet spell date (DOY) over year range":
+                Z = med_wet_doy
+                title = f"Median wet spell date (DOY) — {y0}–{y1}"
+                cb_label = "Median Wet Spell DOY"
+            else:
+                Z = med_onset_doy
+                title = f"Median onset date (DOY) — {y0}–{y1}"
+                cb_label = "Median Onset DOY"
+
+        # Apply Ethiopia mask AFTER Z is defined
+        mask = make_inside_mask(lat_vals, lon_vals, eth_geom)
+        Z = np.where(mask, Z, np.nan)
 
         fig, ax = plt.subplots(figsize=(12, 6))
         Lon, Lat = np.meshgrid(lon_vals, lat_vals)
-        pcm = ax.pcolormesh(Lon, Lat, Z, shading="auto", cmap=cmap_jjas, norm=norm_jjas)
-        eth.boundary.plot(ax=ax, linewidth=3.5,edgecolor="black", zorder=10)
+
+        pcm = ax.pcolormesh(
+            Lon,
+            Lat,
+            Z,
+            shading="auto",
+            cmap=cmap_jjas,
+            norm=norm_jjas,
+        )
+
+        eth.boundary.plot(
+            ax=ax,
+            linewidth=3.5,
+            edgecolor="black",
+            zorder=10,
+        )
 
         ax.set_title(title)
         ax.set_xlabel("Longitude")

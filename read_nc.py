@@ -2,7 +2,7 @@ import xarray as xr
 from pathlib import Path
 
 # Path to a single .nc file OR a folder of .nc files
-DATA_PATH = "obs_subset_ethiopia"  # change to file path if needed
+DATA_PATH = "CHIRPS"  # change to file path if needed
 FILE_GLOB = "*.nc"
 
 

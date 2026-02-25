@@ -15,7 +15,7 @@ from shapely.geometry import Point
 from shapely.prepared import prep
 
 # Colormap utilities
-from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.colors import ListedColormap, BoundaryNorm, TwoSlopeNorm
 
 
 # -----------------------------
@@ -35,10 +35,81 @@ FILE_GLOB = "*.nc"
 CHUNKSIZE = 365
 RAIN_VAR = "precip"
 
+# -----------------------------
+# Default NC mask (always-on)
+# -----------------------------
+DEFAULT_MASK_NC_PATH = "data/chirps_jjas_seasonal_mask_ethiopia_0p25.nc"
+DEFAULT_MASK_VAR = "mask"  # change if your file uses a different variable name
+APPLY_DEFAULT_NC_MASK_ALWAYS = True
+
+
+@st.cache_resource
+def infer_mask_var(mask_path: str) -> str:
+    ds = xr.open_dataset(mask_path)
+    if len(ds.data_vars) == 0:
+        raise ValueError(f"No data variables found in mask file: {mask_path}")
+    # pick first data variable
+    return list(ds.data_vars)[0]
+
 
 # -----------------------------
 # Helpers: coordinate detection
 # -----------------------------
+
+@st.cache_resource
+def load_nc_mask(mask_path: str, mask_var: str) -> xr.DataArray:
+    ds = xr.open_dataset(mask_path)
+    if mask_var not in ds:
+        raise KeyError(
+            f"Mask variable '{mask_var}' not found. Available: {list(ds.data_vars)}"
+        )
+    da = ds[mask_var]
+    return da
+
+
+def apply_nc_mask_to_Z(
+    Z: np.ndarray,
+    lat_vals: np.ndarray,
+    lon_vals: np.ndarray,
+    mask_da: xr.DataArray,
+) -> np.ndarray:
+    """
+    Z is (lat, lon). mask_da can be on its own lat/lon grid.
+    We interpolate mask to (lat_vals, lon_vals), then apply.
+    Assumes mask is 1 for keep, 0 for mask-out (or boolean).
+    """
+    # Guess coord names on mask
+    mask_ds = mask_da.to_dataset(name="mask")
+    mlat, mlon, _ = (
+        guess_lat_lon_time_names(mask_ds)
+        if "time" in mask_ds.coords or "time" in mask_ds.dims
+        else (
+            _find_coord_name(mask_ds, ["latitude", "lat", "y"]),
+            _find_coord_name(mask_ds, ["longitude", "lon", "x"]),
+            None,
+        )
+    )
+    if mlat is None or mlon is None:
+        raise ValueError("Could not infer lat/lon names in mask .nc")
+
+    # Normalize lon if needed
+    mask_ds = maybe_normalize_longitudes(mask_ds, mlon)
+    mask_da2 = mask_ds["mask"]
+
+    # Interpolate mask onto target grid
+    mask_on_grid = mask_da2.interp(
+        {
+            mlat: xr.DataArray(lat_vals, dims="lat"),
+            mlon: xr.DataArray(lon_vals, dims="lon"),
+        },
+        method="nearest",
+    ).values
+
+    keep = mask_on_grid.astype(bool)  # works if 0/1 or True/False
+    return np.where(keep, Z, np.nan)
+
+DEFAULT_MASK_VAR = infer_mask_var(DEFAULT_MASK_NC_PATH)
+
 def _find_coord_name(ds: xr.Dataset, candidates: List[str]) -> Optional[str]:
     for name in candidates:
         if name in ds.coords:
@@ -144,9 +215,9 @@ def detect_onset(
         return None, None
 
     for t in range(start_idx, t_stop):
-        if np.nansum(r[t : t + accum_days]) >= accum_mm:
-            future_wet = wet[t : t + lookahead_days]
-
+        window = r[t : t + accum_days]
+        if np.nansum(window) >= accum_mm and np.all(window >= wet_day_mm):
+            future_wet = wet[t + accum_days : t + accum_days + lookahead_days]
             dry_run = 0
             ok = True
             for is_wet in future_wet:
@@ -167,6 +238,7 @@ def detect_onset(
 def detect_first_wet_spell(
     dates: pd.Series,
     rain: np.ndarray,
+    wet_day_mm: float,
     accum_days: int,
     accum_mm: float,
     start_month: int,
@@ -174,11 +246,6 @@ def detect_first_wet_spell(
     end_month: int,
     end_day: int,
 ) -> Tuple[Optional[pd.Timestamp], Optional[int]]:
-    """
-    Wet spell candidate = first day t such that sum(r[t:t+accum_days]) >= accum_mm,
-    within the search window. (No dry-spell constraint.)
-    Returns (date, index).
-    """
     r = np.asarray(rain, dtype=float)
     d = pd.to_datetime(dates).reset_index(drop=True)
 
@@ -194,8 +261,17 @@ def detect_first_wet_spell(
     t_stop = min(last_t + 1, end_idx)
 
     for t in range(start_idx, max(start_idx, t_stop)):
-        if np.nansum(r[t : t + accum_days]) >= accum_mm:
-            return d.iloc[t], t
+        window = r[t : t + accum_days]
+
+        # ✅ must satisfy accumulation threshold
+        if np.nansum(window) < accum_mm:
+            continue
+
+        # ✅ AND every day in the window must be a wet day
+        if np.any(window < wet_day_mm):
+            continue
+
+        return d.iloc[t], t
 
     return None, None
 
@@ -403,6 +479,7 @@ def compute_agg_doy_maps(
                 wet_cand_date, wet_cand_idx = detect_first_wet_spell(
                     dates=pd.Series(times),
                     rain=rain_ij,
+                    wet_day_mm=float(wet_day_mm),
                     accum_days=int(accum_days),
                     accum_mm=float(accum_mm),
                     start_month=int(start_month),
@@ -507,6 +584,7 @@ def compute_single_year_doy_maps(
             wet_cand_date, wet_cand_idx = detect_first_wet_spell(
                 dates=pd.Series(times),
                 rain=rain_ij,
+                wet_day_mm=float(wet_day_mm),
                 accum_days=int(accum_days),
                 accum_mm=float(accum_mm),
                 start_month=int(start_month),
@@ -841,6 +919,7 @@ def plot_map_for_dataset(
         lon_vals = da_map[lon_i].values
         mask = make_inside_mask(lat_vals, lon_vals, eth_geom)
         Z = np.where(mask, da_map.values, np.nan)
+        
 
         fig, ax = plt.subplots(figsize=(12, 6))
         Lon, Lat = np.meshgrid(lon_vals, lat_vals)
@@ -972,6 +1051,186 @@ def plot_map_for_dataset(
 # -----------------------------
 # Map view
 # -----------------------------
+
+
+def _ethiopia_clip_and_mask(
+    da: xr.DataArray,
+    lat_name: str,
+    lon_name: str,
+    eth_geom,
+    eth_bounds: Tuple[float, float, float, float],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    eth_lon_min, eth_lat_min, eth_lon_max, eth_lat_max = eth_bounds
+
+    da = da.sel(
+        {
+            lat_name: slice(eth_lat_min, eth_lat_max),
+            lon_name: slice(eth_lon_min, eth_lon_max),
+        }
+    )
+
+    lat_vals = da[lat_name].values
+    lon_vals = da[lon_name].values
+
+    mask = make_inside_mask(lat_vals, lon_vals, eth_geom)  # Ethiopia polygon mask
+    Z = np.where(mask, da.values, np.nan)
+
+    return lat_vals, lon_vals, Z
+
+
+def compute_map_Z_for_dataset(
+    dataset_key: str,
+    map_kind: str,
+    year_mode: str,
+    y0: int,
+    y1: int,
+    agg_mode: AggMode,
+    date_sel: Optional[pd.Timestamp],
+    eth,
+    eth_geom,
+    eth_bounds: Tuple[float, float, float, float],
+    use_nc_mask: bool,
+    mask_nc_path: Optional[str],
+    mask_var: Optional[str],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str, str, str]:
+    """
+    Returns:
+      lat_vals, lon_vals, Z, title, cb_label, kind_tag
+    kind_tag in {"rain", "doy"}
+    """
+    ds_i = DS_BY_KEY[dataset_key]
+    files_i = FILES_BY_KEY[dataset_key]
+    lat_i, lon_i, time_i = COORDS_BY_KEY[dataset_key]
+
+    # IMPORTANT: apply optional mask early (lazy) for rainfall maps
+    # ds_i = apply_optional_mask_to_ds(ds_i, lat_i, lon_i, use_mask=use_mask)
+
+    if map_kind == "Seasonal mean rainfall (JJAS)":
+        da_season = ds_i[RAIN_VAR].sel({time_i: slice(f"{y0}-01-01", f"{y1}-12-31")})
+        da_season = da_season.where(
+            da_season[time_i].dt.month.isin([6, 7, 8, 9]), drop=True
+        )
+        da_map = da_season.mean(dim=time_i).compute()
+
+        lat_vals, lon_vals, Z = _ethiopia_clip_and_mask(
+            da_map, lat_i, lon_i, eth_geom, eth_bounds
+        )
+
+        if use_nc_mask:
+            if not mask_nc_path or not mask_var:
+                raise ValueError("Mask path/var missing")
+            mask_da = load_nc_mask(mask_nc_path, mask_var)
+            Z = apply_nc_mask_to_Z(Z, lat_vals, lon_vals, mask_da)
+
+        title = (
+            f"{dataset_key} — Seasonal (JJAS) mean rainfall — {y0}"
+            if y0 == y1
+            else f"{dataset_key} — Seasonal (JJAS) mean rainfall — {y0}–{y1}"
+        )
+        return lat_vals, lon_vals, Z, title, "Rainfall (mm/day)", "rain"
+
+    if map_kind == "Daily rainfall map (selected date)":
+        if date_sel is None:
+            raise ValueError("date_sel is required for daily rainfall map")
+
+        da_day = ds_i[RAIN_VAR].sel({time_i: date_sel}, method="nearest").compute()
+        lat_vals, lon_vals, Z = _ethiopia_clip_and_mask(
+            da_day, lat_i, lon_i, eth_geom, eth_bounds
+        )
+        if use_nc_mask:
+            if not mask_nc_path or not mask_var:
+                raise ValueError("Mask path/var missing")
+            mask_da = load_nc_mask(mask_nc_path, mask_var)
+            Z = apply_nc_mask_to_Z(Z, lat_vals, lon_vals, mask_da)
+
+        shown_date = pd.to_datetime(da_day[time_i].values).date()
+        title = f"{dataset_key} — Daily rainfall — {shown_date}"
+        return lat_vals, lon_vals, Z, title, "Rainfall (mm/day)", "rain"
+
+    # ---- DOY maps ----
+    if year_mode == "Single year":
+        lat_vals, lon_vals, wet_doy, onset_doy = compute_single_year_doy_maps(
+            ds_path_list=files_i,
+            var=RAIN_VAR,
+            lat_name=lat_i,
+            lon_name=lon_i,
+            time_name=time_i,
+            year=int(y0),
+            wet_day_mm=float(wet_day_mm),
+            accum_days=int(accum_days),
+            accum_mm=float(accum_mm),
+            dry_spell_days=int(dry_spell_days),
+            lookahead_days=int(lookahead_days),
+            start_month=int(start_month),
+            start_day=int(start_day),
+            end_month=int(end_month),
+            end_day=int(end_day),
+            # use_mask=use_mask,
+        )
+        Z0 = wet_doy if map_kind == "Wet spell date (DOY)" else onset_doy
+        title = (
+            f"{dataset_key} — Wet spell date (DOY) — {y0}"
+            if map_kind == "Wet spell date (DOY)"
+            else f"{dataset_key} — Onset date (DOY) — {y0}"
+        )
+        cb_label = (
+            "Wet Spell DOY" if map_kind == "Wet spell date (DOY)" else "Onset DOY"
+        )
+    else:
+        lat_vals, lon_vals, agg_wet_doy, agg_onset_doy = compute_agg_doy_maps(
+            ds_path_list=files_i,
+            var=RAIN_VAR,
+            lat_name=lat_i,
+            lon_name=lon_i,
+            time_name=time_i,
+            y0=int(y0),
+            y1=int(y1),
+            agg_mode=agg_mode,
+            wet_day_mm=float(wet_day_mm),
+            accum_days=int(accum_days),
+            accum_mm=float(accum_mm),
+            dry_spell_days=int(dry_spell_days),
+            lookahead_days=int(lookahead_days),
+            start_month=int(start_month),
+            start_day=int(start_day),
+            end_month=int(end_month),
+            end_day=int(end_day),
+            # use_mask=use_mask,
+        )
+        Z0 = agg_wet_doy if map_kind == "Wet spell date (DOY)" else agg_onset_doy
+        title = (
+            f"{dataset_key} — {agg_mode} wet spell date (DOY) — {y0}–{y1}"
+            if map_kind == "Wet spell date (DOY)"
+            else f"{dataset_key} — {agg_mode} onset date (DOY) — {y0}–{y1}"
+        )
+        cb_label = (
+            f"{agg_mode} Wet Spell DOY"
+            if map_kind == "Wet spell date (DOY)"
+            else f"{agg_mode} Onset DOY"
+        )
+
+    # Ethiopia polygon mask on DOY grids
+    # (lat_vals/lon_vals already correspond to full grid)
+    mask = make_inside_mask(lat_vals, lon_vals, eth_geom)
+    Z = np.where(mask, Z0, np.nan)
+
+    if use_nc_mask:
+        if not mask_nc_path or not mask_var:
+            raise ValueError("use_nc_mask=True but mask_nc_path/mask_var not provided")
+        mask_da = load_nc_mask(mask_nc_path, mask_var)
+        Z = apply_nc_mask_to_Z(Z, lat_vals, lon_vals, mask_da)
+
+    return lat_vals, lon_vals, Z, title, cb_label, "doy"
+
+
+def _nanminmax(a: np.ndarray) -> Tuple[float, float]:
+    vmin = float(np.nanmin(a)) if np.isfinite(np.nanmin(a)) else 0.0
+    vmax = float(np.nanmax(a)) if np.isfinite(np.nanmax(a)) else 1.0
+    if vmin == vmax:
+        vmax = vmin + 1e-6
+    return vmin, vmax
+
+
 if mode == "Map (Ethiopia)":
     st.subheader("Map view options")
 
@@ -1034,14 +1293,17 @@ if mode == "Map (Ethiopia)":
             st.error("End year must be ≥ start year.")
             st.stop()
 
+    use_nc_mask = APPLY_DEFAULT_NC_MASK_ALWAYS
+    mask_nc_path = DEFAULT_MASK_NC_PATH
+    mask_var = DEFAULT_MASK_VAR
+
     eth = load_ethiopia_boundary()
     eth_geom = eth.geometry.iloc[0]
-    eth_bounds = eth.total_bounds
-    eth_lon_min, eth_lat_min, eth_lon_max, eth_lat_max = map(float, eth_bounds)
+    eth_bounds = tuple(map(float, eth.total_bounds))  # (xmin, ymin, xmax, ymax)
 
+    # Date selector (shared) for daily map
     date_sel = None
     if map_kind == "Daily rainfall map (selected date)":
-        # Use common overlap window when >1 dataset selected
         tmin_ui, tmax_ui = tmin_common, tmax_common
         default_date = pd.Timestamp(year=int(year), month=7, day=15)
         default_date = min(max(default_date, tmin_ui), tmax_ui)
@@ -1054,64 +1316,344 @@ if mode == "Map (Ethiopia)":
         )
         date_sel = pd.Timestamp(date_in)
 
+    # ---- SINGLE DATASET: show one panel ----
     if len(selected_datasets) == 1:
         key = selected_datasets[0]
-        plot_map_for_dataset(
+        lat_vals, lon_vals, Z, title, cb_label, kind_tag = compute_map_Z_for_dataset(
             dataset_key=key,
+            map_kind=map_kind,
             year_mode=year_mode,
             y0=int(y0),
             y1=int(y1),
             agg_mode=agg_mode,
-            map_kind=map_kind,
+            date_sel=date_sel,
             eth=eth,
             eth_geom=eth_geom,
-            eth_lon_min=eth_lon_min,
-            eth_lat_min=eth_lat_min,
-            eth_lon_max=eth_lon_max,
-            eth_lat_max=eth_lat_max,
-            date_sel=date_sel,
+            eth_bounds=eth_bounds,
+            use_nc_mask=use_nc_mask,
+            mask_nc_path=mask_nc_path,
+            mask_var=mask_var,
         )
-    else:
-        cL, cR = st.columns([1, 1])
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        Lon, Lat = np.meshgrid(lon_vals, lat_vals)
+
+        if kind_tag == "rain":
+            vmin, vmax = _nanminmax(Z)
+            pcm = ax.pcolormesh(
+                Lon, Lat, Z, shading="auto", cmap="Blues", vmin=vmin, vmax=vmax
+            )
+        else:
+            cmap_jjas, norm_jjas, tick_positions, tick_labels = build_jjas_doy_cmap()
+            pcm = ax.pcolormesh(
+                Lon, Lat, Z, shading="auto", cmap=cmap_jjas, norm=norm_jjas
+            )
+
+        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+        ax.set_title(title)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+
+        cb = fig.colorbar(pcm, ax=ax)
+        cb.set_label(cb_label)
+        if kind_tag == "doy":
+            cb.set_ticks(tick_positions)
+            cb.set_ticklabels(tick_labels)
+
+        st.pyplot(fig)
+        st.stop()
+
+    # ---- TWO DATASETS: ALWAYS show CHIRPS, ENACTS, and DIFF ----
+    # (Assumes your multiselect only includes these two keys)
+    left_key, right_key = "CHIRPS", "ENACTS"
+    if left_key not in selected_datasets or right_key not in selected_datasets:
+        # fallback: just use first two selected
         left_key, right_key = selected_datasets[0], selected_datasets[1]
 
-        with cL:
-            st.markdown(f"### {left_key}")
-            plot_map_for_dataset(
-                dataset_key=left_key,
-                year_mode=year_mode,
-                y0=int(y0),
-                y1=int(y1),
-                agg_mode=agg_mode,
-                map_kind=map_kind,
-                eth=eth,
-                eth_geom=eth_geom,
-                eth_lon_min=eth_lon_min,
-                eth_lat_min=eth_lat_min,
-                eth_lon_max=eth_lon_max,
-                eth_lat_max=eth_lat_max,
-                date_sel=date_sel,
-            )
+    lat1, lon1, Z1, title1, cb1, kind1 = compute_map_Z_for_dataset(
+        dataset_key=left_key,
+        map_kind=map_kind,
+        year_mode=year_mode,
+        y0=int(y0),
+        y1=int(y1),
+        agg_mode=agg_mode,
+        date_sel=date_sel,
+        eth=eth,
+        eth_geom=eth_geom,
+        eth_bounds=eth_bounds,
+        use_nc_mask=use_nc_mask,
+        mask_nc_path=mask_nc_path,
+        mask_var=mask_var,
+    )
+    lat2, lon2, Z2, title2, cb2, kind2 = compute_map_Z_for_dataset(
+        dataset_key=right_key,
+        map_kind=map_kind,
+        year_mode=year_mode,
+        y0=int(y0),
+        y1=int(y1),
+        agg_mode=agg_mode,
+        date_sel=date_sel,
+        eth=eth,
+        eth_geom=eth_geom,
+        eth_bounds=eth_bounds,
+        use_nc_mask=use_nc_mask,
+        mask_nc_path=mask_nc_path,
+        mask_var=mask_var,
+    )
 
-        with cR:
-            st.markdown(f"### {right_key}")
-            plot_map_for_dataset(
-                dataset_key=right_key,
-                year_mode=year_mode,
-                y0=int(y0),
-                y1=int(y1),
-                agg_mode=agg_mode,
-                map_kind=map_kind,
-                eth=eth,
-                eth_geom=eth_geom,
-                eth_lon_min=eth_lon_min,
-                eth_lat_min=eth_lat_min,
-                eth_lon_max=eth_lon_max,
-                eth_lat_max=eth_lat_max,
-                date_sel=date_sel,
-            )
+    # Assume same grid after Ethiopia clipping; if not, you’d need regridding
+    if Z1.shape != Z2.shape:
+        st.error(
+            "CHIRPS and ENACTS map grids do not match after clipping. Need regridding to compute difference."
+        )
+        st.stop()
 
+    Zdiff = Z1 - Z2
 
+    # Shared color scaling for CHIRPS & ENACTS
+    if kind1 != kind2:
+        st.error("Internal error: map kind mismatch between datasets.")
+        st.stop()
+
+    if kind1 == "rain":
+        vmin_12 = float(np.nanmin([np.nanmin(Z1), np.nanmin(Z2)]))
+        vmax_12 = float(np.nanmax([np.nanmax(Z1), np.nanmax(Z2)]))
+        if not np.isfinite(vmin_12) or not np.isfinite(vmax_12) or vmin_12 == vmax_12:
+            vmin_12, vmax_12 = 0.0, 1.0
+
+        max_abs = float(np.nanmax(np.abs(Zdiff)))
+        if not np.isfinite(max_abs) or max_abs == 0:
+            max_abs = 1e-6
+        diff_norm = TwoSlopeNorm(vcenter=0.0, vmin=-max_abs, vmax=max_abs)
+
+        # --- CHIRPS ---
+        st.markdown(f"## {left_key}")
+        fig, ax = plt.subplots(figsize=(12, 7))
+        Lon, Lat = np.meshgrid(lon1, lat1)
+        pcm = ax.pcolormesh(
+            Lon, Lat, Z1, shading="auto", cmap="Blues", vmin=vmin_12, vmax=vmax_12
+        )
+        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+        ax.set_title(title1)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        cb = fig.colorbar(pcm, ax=ax)
+        cb.set_label(cb1)
+        st.pyplot(fig)
+
+        # --- ENACTS ---
+        st.markdown(f"## {right_key}")
+        fig, ax = plt.subplots(figsize=(12, 7))
+        Lon, Lat = np.meshgrid(lon2, lat2)
+        pcm = ax.pcolormesh(
+            Lon, Lat, Z2, shading="auto", cmap="Blues", vmin=vmin_12, vmax=vmax_12
+        )
+        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+        ax.set_title(title2)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        cb = fig.colorbar(pcm, ax=ax)
+        cb.set_label(cb2)
+        st.pyplot(fig)
+
+        # --- DIFF ---
+        st.markdown(f"## {left_key} − {right_key}")
+        fig, ax = plt.subplots(figsize=(12, 7))
+        Lon, Lat = np.meshgrid(lon1, lat1)
+        pcm = ax.pcolormesh(Lon, Lat, Zdiff, shading="auto", cmap="RdBu_r", norm=diff_norm)
+        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+        ax.set_title(f"Difference — {map_kind}")
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        cb = fig.colorbar(pcm, ax=ax)
+        cb.set_label(f"{cb1} ({left_key} − {right_key})")
+        st.pyplot(fig)
+
+    else:
+        # DOY maps
+        cmap_jjas, norm_jjas, tick_positions, tick_labels = build_jjas_doy_cmap()
+
+        max_abs = float(np.nanmax(np.abs(Zdiff)))
+        if not np.isfinite(max_abs) or max_abs == 0:
+            max_abs = 1e-6
+        diff_norm = TwoSlopeNorm(vcenter=0.0, vmin=-max_abs, vmax=max_abs)
+
+        # --- CHIRPS ---
+        st.markdown(f"## {left_key}")
+        fig, ax = plt.subplots(figsize=(12, 7))
+        Lon, Lat = np.meshgrid(lon1, lat1)
+        pcm = ax.pcolormesh(Lon, Lat, Z1, shading="auto", cmap=cmap_jjas, norm=norm_jjas)
+        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+        ax.set_title(title1)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        cb = fig.colorbar(pcm, ax=ax)
+        cb.set_label(cb1)
+        cb.set_ticks(tick_positions)
+        cb.set_ticklabels(tick_labels)
+        st.pyplot(fig)
+
+        # --- ENACTS ---
+        st.markdown(f"## {right_key}")
+        fig, ax = plt.subplots(figsize=(12, 7))
+        Lon, Lat = np.meshgrid(lon2, lat2)
+        pcm = ax.pcolormesh(Lon, Lat, Z2, shading="auto", cmap=cmap_jjas, norm=norm_jjas)
+        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+        ax.set_title(title2)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        cb = fig.colorbar(pcm, ax=ax)
+        cb.set_label(cb2)
+        cb.set_ticks(tick_positions)
+        cb.set_ticklabels(tick_labels)
+        st.pyplot(fig)
+
+        # --- DIFF ---
+        st.markdown(f"## {left_key} − {right_key}")
+        fig, ax = plt.subplots(figsize=(12, 7))
+        Lon, Lat = np.meshgrid(lon1, lat1)
+        pcm = ax.pcolormesh(Lon, Lat, Zdiff, shading="auto", cmap="RdBu_r", norm=diff_norm)
+        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+        ax.set_title(f"Difference — {map_kind}")
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        cb = fig.colorbar(pcm, ax=ax)
+        cb.set_label(f"DOY difference ({left_key} − {right_key})")
+        st.pyplot(fig)
+
+    # # c1, c2, c3 = st.columns([1, 1, 1])
+
+    # # Shared color scaling for CHIRPS & ENACTS
+    # if kind1 != kind2:
+    #     st.error("Internal error: map kind mismatch between datasets.")
+    #     st.stop()
+
+    # if kind1 == "rain":
+    #     vmin_12 = float(np.nanmin([np.nanmin(Z1), np.nanmin(Z2)]))
+    #     vmax_12 = float(np.nanmax([np.nanmax(Z1), np.nanmax(Z2)]))
+    #     if not np.isfinite(vmin_12) or not np.isfinite(vmax_12) or vmin_12 == vmax_12:
+    #         vmin_12, vmax_12 = 0.0, 1.0
+
+    #     max_abs = float(np.nanmax(np.abs(Zdiff)))
+    #     if not np.isfinite(max_abs) or max_abs == 0:
+    #         max_abs = 1e-6
+
+    #     diff_norm = TwoSlopeNorm(vcenter=0.0, vmin=-max_abs, vmax=max_abs)
+
+    #     with c1:
+    #         st.markdown(f"### {left_key}")
+    #         fig, ax = plt.subplots(figsize=(6, 5))
+    #         Lon, Lat = np.meshgrid(lon1, lat1)
+    #         pcm = ax.pcolormesh(
+    #             Lon, Lat, Z1, shading="auto", cmap="Blues", vmin=vmin_12, vmax=vmax_12
+    #         )
+    #         eth.boundary.plot(
+    #             ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10
+    #         )
+    #         ax.set_title(title1)
+    #         ax.set_xlabel("Longitude")
+    #         ax.set_ylabel("Latitude")
+    #         cb = fig.colorbar(pcm, ax=ax)
+    #         cb.set_label(cb1)
+    #         st.pyplot(fig)
+
+    #     with c2:
+    #         st.markdown(f"### {right_key}")
+    #         fig, ax = plt.subplots(figsize=(6, 5))
+    #         Lon, Lat = np.meshgrid(lon2, lat2)
+    #         pcm = ax.pcolormesh(
+    #             Lon, Lat, Z2, shading="auto", cmap="Blues", vmin=vmin_12, vmax=vmax_12
+    #         )
+    #         eth.boundary.plot(
+    #             ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10
+    #         )
+    #         ax.set_title(title2)
+    #         ax.set_xlabel("Longitude")
+    #         ax.set_ylabel("Latitude")
+    #         cb = fig.colorbar(pcm, ax=ax)
+    #         cb.set_label(cb2)
+    #         st.pyplot(fig)
+
+    #     with c3:
+    #         st.markdown(f"### {left_key} − {right_key}")
+    #         fig, ax = plt.subplots(figsize=(6, 5))
+    #         Lon, Lat = np.meshgrid(lon1, lat1)
+    #         pcm = ax.pcolormesh(
+    #             Lon, Lat, Zdiff, shading="auto", cmap="RdBu_r", norm=diff_norm
+    #         )
+    #         eth.boundary.plot(
+    #             ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10
+    #         )
+    #         ax.set_title(f"Difference — {map_kind}")
+    #         ax.set_xlabel("Longitude")
+    #         ax.set_ylabel("Latitude")
+    #         cb = fig.colorbar(pcm, ax=ax)
+    #         cb.set_label(f"{cb1} ({left_key} − {right_key})")
+    #         st.pyplot(fig)
+
+    # else:
+    #     # DOY maps: CHIRPS & ENACTS share same seasonal palette by construction
+    #     cmap_jjas, norm_jjas, tick_positions, tick_labels = build_jjas_doy_cmap()
+
+    #     max_abs = float(np.nanmax(np.abs(Zdiff)))
+    #     if not np.isfinite(max_abs) or max_abs == 0:
+    #         max_abs = 1e-6
+    #     diff_norm = TwoSlopeNorm(vcenter=0.0, vmin=-max_abs, vmax=max_abs)
+
+    #     with c1:
+    #         st.markdown(f"### {left_key}")
+    #         fig, ax = plt.subplots(figsize=(6, 5))
+    #         Lon, Lat = np.meshgrid(lon1, lat1)
+    #         pcm = ax.pcolormesh(
+    #             Lon, Lat, Z1, shading="auto", cmap=cmap_jjas, norm=norm_jjas
+    #         )
+    #         eth.boundary.plot(
+    #             ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10
+    #         )
+    #         ax.set_title(title1)
+    #         ax.set_xlabel("Longitude")
+    #         ax.set_ylabel("Latitude")
+    #         cb = fig.colorbar(pcm, ax=ax)
+    #         cb.set_label(cb1)
+    #         cb.set_ticks(tick_positions)
+    #         cb.set_ticklabels(tick_labels)
+    #         st.pyplot(fig)
+
+    #     with c2:
+    #         st.markdown(f"### {right_key}")
+    #         fig, ax = plt.subplots(figsize=(6, 5))
+    #         Lon, Lat = np.meshgrid(lon2, lat2)
+    #         pcm = ax.pcolormesh(
+    #             Lon, Lat, Z2, shading="auto", cmap=cmap_jjas, norm=norm_jjas
+    #         )
+    #         eth.boundary.plot(
+    #             ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10
+    #         )
+    #         ax.set_title(title2)
+    #         ax.set_xlabel("Longitude")
+    #         ax.set_ylabel("Latitude")
+    #         cb = fig.colorbar(pcm, ax=ax)
+    #         cb.set_label(cb2)
+    #         cb.set_ticks(tick_positions)
+    #         cb.set_ticklabels(tick_labels)
+    #         st.pyplot(fig)
+
+    #     with c3:
+    #         st.markdown(f"### {left_key} − {right_key}")
+    #         fig, ax = plt.subplots(figsize=(6, 5))
+    #         Lon, Lat = np.meshgrid(lon1, lat1)
+    #         pcm = ax.pcolormesh(
+    #             Lon, Lat, Zdiff, shading="auto", cmap="RdBu_r", norm=diff_norm
+    #         )
+    #         eth.boundary.plot(
+    #             ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10
+    #         )
+    #         ax.set_title(f"Difference — {map_kind}")
+    #         ax.set_xlabel("Longitude")
+    #         ax.set_ylabel("Latitude")
+    #         cb = fig.colorbar(pcm, ax=ax)
+    #         cb.set_label(f"DOY difference ({left_key} − {right_key})")
+    #         st.pyplot(fig)
 # -----------------------------
 # Point time series
 # -----------------------------
@@ -1140,6 +1682,7 @@ if show_ts:
             wet_cand_date, wet_cand_idx = detect_first_wet_spell(
                 dates=df_ts["time"],
                 rain=df_ts["rain"].values,
+                wet_day_mm=float(wet_day_mm),
                 accum_days=int(accum_days),
                 accum_mm=float(accum_mm),
                 start_month=int(start_month),

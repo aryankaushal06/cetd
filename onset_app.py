@@ -399,7 +399,7 @@ def build_jjas_doy_cmap() -> Tuple[ListedColormap, BoundaryNorm, List[int], List
     return cmap_jjas, norm_jjas, tick_positions, tick_labels
 
 
-# Year-range aggregation maps 
+# Year-range aggregation maps
 AggMode = Literal["Median", "Mean"]
 
 @st.cache_data(show_spinner=True)
@@ -1161,101 +1161,117 @@ if mode == "Map (Ethiopia)":
             max_abs = 1e-6
         diff_norm = TwoSlopeNorm(vcenter=0.0, vmin=-max_abs, vmax=max_abs)
 
-        st.markdown(f"## {left_key}")
-        fig, ax = plt.subplots(figsize=(12, 7))
-        Lon, Lat = np.meshgrid(lon1, lat1)
-        pcm = ax.pcolormesh(
-            Lon, Lat, Z1, shading="auto", cmap="Blues", vmin=vmin_12, vmax=vmax_12
-        )
-        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-        ax.set_title(title1)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        cb = fig.colorbar(pcm, ax=ax)
-        cb.set_label(cb1)
-        st.pyplot(fig)
+        c1, c2, c3 = st.columns(3)
 
-        st.markdown(f"## {right_key}")
-        fig, ax = plt.subplots(figsize=(12, 7))
-        Lon, Lat = np.meshgrid(lon2, lat2)
-        pcm = ax.pcolormesh(
-            Lon, Lat, Z2, shading="auto", cmap="Blues", vmin=vmin_12, vmax=vmax_12
-        )
-        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-        ax.set_title(title2)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        cb = fig.colorbar(pcm, ax=ax)
-        cb.set_label(cb2)
-        st.pyplot(fig)
+        with c1:
+            st.markdown(f"### {left_key}")
+            fig, ax = plt.subplots(figsize=(5.2, 4.2))
+            Lon, Lat = np.meshgrid(lon1, lat1)
+            pcm = ax.pcolormesh(
+                Lon, Lat, Z1, shading="auto", cmap="Blues", vmin=vmin_12, vmax=vmax_12
+            )
+            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+            ax.set_title(title1)
+            ax.set_xlabel("Lon")
+            ax.set_ylabel("Lat")
+            cb = fig.colorbar(pcm, ax=ax)
+            cb.set_label(cb1)
+            st.pyplot(fig)
 
-        st.markdown(f"## {left_key} − {right_key}")
-        fig, ax = plt.subplots(figsize=(12, 7))
-        Lon, Lat = np.meshgrid(lon1, lat1)
-        pcm = ax.pcolormesh(
-            Lon, Lat, Zdiff, shading="auto", cmap="RdBu_r", norm=diff_norm
-        )
-        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-        ax.set_title(f"Difference — {map_kind}")
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        cb = fig.colorbar(pcm, ax=ax)
-        cb.set_label(f"{cb1} ({left_key} − {right_key})")
-        st.pyplot(fig)
+        with c2:
+            st.markdown(f"### {right_key}")
+            fig, ax = plt.subplots(figsize=(5.2, 4.2))
+            Lon, Lat = np.meshgrid(lon2, lat2)
+            pcm = ax.pcolormesh(
+                Lon, Lat, Z2, shading="auto", cmap="Blues", vmin=vmin_12, vmax=vmax_12
+            )
+            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+            ax.set_title(title2)
+            ax.set_xlabel("Lon")
+            ax.set_ylabel("Lat")
+            cb = fig.colorbar(pcm, ax=ax)
+            cb.set_label(cb2)
+            st.pyplot(fig)
+
+        with c3:
+            st.markdown(f"### {left_key} − {right_key}")
+            fig, ax = plt.subplots(figsize=(5.2, 4.2))
+            Lon, Lat = np.meshgrid(lon1, lat1)
+            pcm = ax.pcolormesh(
+                Lon, Lat, Zdiff, shading="auto", cmap="RdBu_r", norm=diff_norm
+            )
+            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+            ax.set_title(f"Difference — {map_kind}")
+            ax.set_xlabel("Lon")
+            ax.set_ylabel("Lat")
+            cb = fig.colorbar(pcm, ax=ax)
+            cb.set_label(f"{cb1} ({left_key} − {right_key})")
+            st.pyplot(fig)
 
     else:
         cmap_jjas, norm_jjas, tick_positions, tick_labels = build_jjas_doy_cmap()
 
-        max_abs = float(np.nanmax(np.abs(Zdiff)))
-        if not np.isfinite(max_abs) or max_abs == 0:
-            max_abs = 1e-6
-        diff_norm = TwoSlopeNorm(vcenter=0.0, vmin=-max_abs, vmax=max_abs)
+        c1, c2, c3 = st.columns(3)
 
-        st.markdown(f"## {left_key}")
-        fig, ax = plt.subplots(figsize=(12, 7))
-        Lon, Lat = np.meshgrid(lon1, lat1)
-        pcm = ax.pcolormesh(
-            Lon, Lat, Z1, shading="auto", cmap=cmap_jjas, norm=norm_jjas
-        )
-        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-        ax.set_title(title1)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        cb = fig.colorbar(pcm, ax=ax)
-        cb.set_label(cb1)
-        cb.set_ticks(tick_positions)
-        cb.set_ticklabels(tick_labels)
-        st.pyplot(fig)
+        # --- LEFT DOY map ---
+        with c1:
+            st.markdown(f"### {left_key}")
+            fig, ax = plt.subplots(figsize=(5.2, 4.2))
+            Lon, Lat = np.meshgrid(lon1, lat1)
+            pcm = ax.pcolormesh(
+                Lon, Lat, Z1, shading="auto", cmap=cmap_jjas, norm=norm_jjas
+            )
+            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+            ax.set_title(title1)
+            ax.set_xlabel("Lon")
+            ax.set_ylabel("Lat")
+            cb = fig.colorbar(pcm, ax=ax)
+            cb.set_label(cb1)
+            cb.set_ticks(tick_positions)
+            cb.set_ticklabels(tick_labels)
+            st.pyplot(fig)
 
-        st.markdown(f"## {right_key}")
-        fig, ax = plt.subplots(figsize=(12, 7))
-        Lon, Lat = np.meshgrid(lon2, lat2)
-        pcm = ax.pcolormesh(
-            Lon, Lat, Z2, shading="auto", cmap=cmap_jjas, norm=norm_jjas
-        )
-        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-        ax.set_title(title2)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        cb = fig.colorbar(pcm, ax=ax)
-        cb.set_label(cb2)
-        cb.set_ticks(tick_positions)
-        cb.set_ticklabels(tick_labels)
-        st.pyplot(fig)
+        # --- RIGHT DOY map ---
+        with c2:
+            st.markdown(f"### {right_key}")
+            fig, ax = plt.subplots(figsize=(5.2, 4.2))
+            Lon, Lat = np.meshgrid(lon2, lat2)
+            pcm = ax.pcolormesh(
+                Lon, Lat, Z2, shading="auto", cmap=cmap_jjas, norm=norm_jjas
+            )
+            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+            ax.set_title(title2)
+            ax.set_xlabel("Lon")
+            ax.set_ylabel("Lat")
+            cb = fig.colorbar(pcm, ax=ax)
+            cb.set_label(cb2)
+            cb.set_ticks(tick_positions)
+            cb.set_ticklabels(tick_labels)
+            st.pyplot(fig)
 
-        st.markdown(f"## {left_key} − {right_key}")
-        fig, ax = plt.subplots(figsize=(12, 7))
-        Lon, Lat = np.meshgrid(lon1, lat1)
-        pcm = ax.pcolormesh(
-            Lon, Lat, Zdiff, shading="auto", cmap="RdBu_r", norm=diff_norm
-        )
-        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-        ax.set_title(f"Difference — {map_kind}")
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        cb = fig.colorbar(pcm, ax=ax)
-        cb.set_label(f"DOY difference ({left_key} − {right_key})")
-        st.pyplot(fig)
+        # --- DIFFERENCE MAP: DISCRETE -30..30 DOY ---
+        with c3:
+            st.markdown(f"### {left_key} − {right_key}")
+            fig, ax = plt.subplots(figsize=(5.2, 4.2))
+            Lon, Lat = np.meshgrid(lon1, lat1)
+
+            levels = np.arange(-30, 31, 5)  # -30, -25, ..., 30
+            cmap_diff = plt.cm.get_cmap("RdBu_r", len(levels) - 1)
+            norm_diff = BoundaryNorm(levels, cmap_diff.N)
+
+            Zdiff_plot = np.clip(Zdiff, -30, 30)
+
+            pcm = ax.pcolormesh(
+                Lon, Lat, Zdiff_plot, shading="auto", cmap=cmap_diff, norm=norm_diff
+            )
+            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+            ax.set_title(f"Difference — {map_kind}")
+            ax.set_xlabel("Lon")
+            ax.set_ylabel("Lat")
+
+            cb = fig.colorbar(pcm, ax=ax, ticks=levels)
+            cb.set_label(f"DOY difference ({left_key} − {right_key})")
+            st.pyplot(fig)
 
 # Point time series view
 st.subheader("Point timeseries: rainfall, wet spell start, onset")

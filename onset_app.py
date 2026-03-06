@@ -808,6 +808,137 @@ def add_wet_threshold_trace(fig, wet_thresh, times):
     )
 
 
+def build_station_map(meta: pd.DataFrame, selected: Optional[str]) -> go.Figure:
+    """Interactive station map styled to match the matplotlib weather maps:
+    white background, black Ethiopia boundary, lat/lon axes, red triangle markers.
+    All labels grey by default; selected station label turns black+bold."""
+    import json
+
+    eth_path = Path("data/ethiopia.geojson")
+    with open(eth_path) as f:
+        eth_geojson = json.load(f)
+
+    lats = meta["lat"].tolist()
+    lons = meta["lon"].tolist()
+    names = meta.index.tolist()
+
+    fig = go.Figure()
+
+    # ── Ethiopia boundary (black outline, white fill) ──
+    geom = eth_geojson["features"][0]["geometry"]
+    polys = [geom["coordinates"]] if geom["type"] == "Polygon" else geom["coordinates"]
+    for poly in polys:
+        rings = [poly] if not isinstance(poly[0][0], list) else poly
+        for ring in rings:
+            xs = [pt[0] for pt in ring] + [None]
+            ys = [pt[1] for pt in ring] + [None]
+            fig.add_trace(
+                go.Scatter(
+                    x=xs,
+                    y=ys,
+                    mode="lines",
+                    line=dict(color="black", width=2),
+                    fill="toself",
+                    fillcolor="white",
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
+
+    # ── All stations: grey labels ──
+    unsel_names = [n for n in names if n != selected]
+    unsel_lats = [lats[i] for i, n in enumerate(names) if n != selected]
+    unsel_lons = [lons[i] for i, n in enumerate(names) if n != selected]
+
+    fig.add_trace(
+        go.Scatter(
+            x=unsel_lons,
+            y=unsel_lats,
+            text=unsel_names,
+            customdata=unsel_names,
+            mode="markers+text",
+            marker=dict(
+                symbol="triangle-up",
+                size=9,
+                color="red",
+                line=dict(color="white", width=0.6),
+            ),
+            textposition="top center",
+            textfont=dict(size=9, color="#888888"),
+            hovertemplate="<b>%{text}</b><br>%{y:.3f}°N, %{x:.3f}°E<extra></extra>",
+            showlegend=False,
+        )
+    )
+
+    # ── Selected station: black bold label, drawn on top ──
+    if selected and selected in meta.index:
+        si = names.index(selected)
+        fig.add_trace(
+            go.Scatter(
+                x=[lons[si]],
+                y=[lats[si]],
+                text=[selected],
+                customdata=[selected],
+                mode="markers+text",
+                marker=dict(
+                    symbol="triangle-up",
+                    size=11,
+                    color="red",
+                    line=dict(color="white", width=0.8),
+                ),
+                textposition="top center",
+                textfont=dict(size=10, color="black", family="Arial Black"),
+                hovertemplate=f"<b>{selected}</b><br>{lats[si]:.3f}°N, {lons[si]:.3f}°E<extra></extra>",
+                showlegend=False,
+            )
+        )
+
+    # ── Axes styled like the matplotlib maps ──
+    lon_ticks = [34, 36, 38, 40, 42, 44, 46]
+    lat_ticks = [4, 6, 8, 10, 12, 14]
+
+    fig.update_layout(
+        xaxis=dict(
+            range=[32.5, 48.0],
+            tickvals=lon_ticks,
+            ticktext=[f"{v}°E" for v in lon_ticks],
+            tickfont=dict(size=11, color="black"),
+            title=dict(text="Lon", font=dict(size=12, color="black")),
+            showgrid=False,
+            zeroline=False,
+            scaleanchor="y",
+            scaleratio=1,
+            linecolor="black",
+            linewidth=1,
+            mirror=True,
+        ),
+        yaxis=dict(
+            range=[3.2, 15.2],
+            tickvals=lat_ticks,
+            ticktext=[f"{v}°N" for v in lat_ticks],
+            tickfont=dict(size=11, color="black"),
+            title=dict(text="Lat", font=dict(size=12, color="black")),
+            showgrid=False,
+            zeroline=False,
+            linecolor="black",
+            linewidth=1,
+            mirror=True,
+        ),
+        margin=dict(l=60, r=20, t=40, b=50),
+        height=500,
+        title=dict(
+            text="Rainfall Station Locations — click to select",
+            font=dict(size=13, color="black"),
+            x=0.5,
+            xanchor="center",
+        ),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        dragmode=False,
+    )
+    return fig
+
+
 # ─────────────────────────────────────────────
 # Dataset registry
 # ─────────────────────────────────────────────
@@ -1371,12 +1502,36 @@ if selected_grids and not has_station:
 elif has_station and not selected_grids:
 
     st.info("Map view is not available for EMI Stations. Showing timeseries only.")
-    st.subheader("② Station & time selection")
+    # ── Interactive station map picker ──
+    st.subheader("② Select EMI station")
+    station_list = list(emi_meta.index)
 
-    station_name = st.selectbox("Select EMI station", options=list(emi_meta.index))
+    # No default — None until user clicks
+    if "selected_station" not in st.session_state:
+        st.session_state["selected_station"] = None
+
+    map_fig = build_station_map(emi_meta, st.session_state["selected_station"])
+    clicked = st.plotly_chart(
+        map_fig, use_container_width=True, on_select="rerun", key="station_map"
+    )
+
+    # Handle click: extract station name from customdata
+    if clicked and clicked.get("selection", {}).get("points"):
+        pt = clicked["selection"]["points"][0]
+        cd = pt.get("customdata")
+        if isinstance(cd, list):
+            cd = cd[0]
+        if cd and cd in station_list:
+            st.session_state["selected_station"] = cd
+
+    station_name = st.session_state["selected_station"]
+    if station_name is None:
+        st.info("Click a station on the map to select it.")
+        st.stop()
+
     st_lat = float(emi_meta.loc[station_name, "lat"])
     st_lon = float(emi_meta.loc[station_name, "lon"])
-    st.caption(f"Station coordinates: ({st_lat:.4f}°N, {st_lon:.4f}°E)")
+    st.caption(f"Selected: **{station_name}** — ({st_lat:.4f}°N, {st_lon:.4f}°E)")
 
     ts_year_mode = st.radio(
         "Year selection",
@@ -1455,12 +1610,36 @@ elif has_station and selected_grids:
     st.info(
         "Map view is not available when EMI Stations are selected. Showing timeseries only."
     )
-    st.subheader("② Station & time selection")
+    # ── Interactive station map picker ──
+    st.subheader("② Select EMI station")
+    station_list = list(emi_meta.index)
 
-    station_name = st.selectbox("Select EMI station", options=list(emi_meta.index))
+    # No default — None until user clicks
+    if "selected_station" not in st.session_state:
+        st.session_state["selected_station"] = None
+
+    map_fig = build_station_map(emi_meta, st.session_state["selected_station"])
+    clicked = st.plotly_chart(
+        map_fig, use_container_width=True, on_select="rerun", key="station_map"
+    )
+
+    # Handle click: extract station name from customdata
+    if clicked and clicked.get("selection", {}).get("points"):
+        pt = clicked["selection"]["points"][0]
+        cd = pt.get("customdata")
+        if isinstance(cd, list):
+            cd = cd[0]
+        if cd and cd in station_list:
+            st.session_state["selected_station"] = cd
+
+    station_name = st.session_state["selected_station"]
+    if station_name is None:
+        st.info("Click a station on the map to select it.")
+        st.stop()
+
     st_lat = float(emi_meta.loc[station_name, "lat"])
     st_lon = float(emi_meta.loc[station_name, "lon"])
-    st.caption(f"Station coordinates: ({st_lat:.4f}°N, {st_lon:.4f}°E)")
+    st.caption(f"Selected: **{station_name}** — ({st_lat:.4f}°N, {st_lon:.4f}°E)")
 
     for key in selected_grids:
         la, lo, _ = COORDS_BY_KEY[key]

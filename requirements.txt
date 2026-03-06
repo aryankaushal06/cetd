@@ -12,3 +12,4 @@ shapely
 pyproj
 fiona
 matplotlib>=3.7
+plotly

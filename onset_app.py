@@ -7,16 +7,19 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import streamlit as st
 import geopandas as gpd
 from shapely.geometry import Point
 from shapely.prepared import prep
 from matplotlib.colors import ListedColormap, BoundaryNorm, TwoSlopeNorm
 
-
 st.set_page_config(layout="wide")
 
-LINEWIDTH_ETH = 5.0  # outline for Ethiopia boundary
+# ─────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────
+LINEWIDTH_ETH = 2.0
 DATASET_FOLDERS: Dict[str, str] = {
     "CHIRPS": "CHIRPS",
     "ENACTS": "ENACTS",
@@ -25,47 +28,85 @@ FILE_GLOB = "*.nc"
 CHUNKSIZE = 365
 RAIN_VAR = "precip"
 APP_DIR = Path(__file__).resolve().parent
-
-mask_candidates = sorted(APP_DIR.glob("*mask*ethiopia*.nc"))
-st.sidebar.write("Mask candidates:", [p.name for p in mask_candidates])
-
+STATION_KEY = "EMI Stations"
+STATION_CSV_PATH = APP_DIR / "RF_Station_Grid_Format.csv"
 DEFAULT_MASK_NC_PATH = APP_DIR / "chirps_jjas_seasonal_mask_ethiopia_0p25.nc"
-st.sidebar.write(
-    "Using mask:", str(DEFAULT_MASK_NC_PATH), "exists=", DEFAULT_MASK_NC_PATH.exists()
+
+DATASET_COLORS = {
+    "CHIRPS": {"rain": "steelblue", "wet": "#1a1aff", "onset": "#000080"},
+    "ENACTS": {"rain": "darkorange", "wet": "#cc0000", "onset": "#660000"},
+    STATION_KEY: {"rain": "#2ca02c", "wet": "#7fff00", "onset": "#006400"},
+}
+
+# ─────────────────────────────────────────────
+# Sidebar: onset parameters
+# ─────────────────────────────────────────────
+st.sidebar.header("Onset / Wet spell parameters")
+wet_day_mm = st.sidebar.number_input(
+    "Wet day threshold (mm/day)", min_value=0.0, value=1.0, step=0.1
+)
+accum_days = st.sidebar.number_input(
+    "Accumulation window (days)", min_value=1, value=3, step=1
+)
+accum_mm = st.sidebar.number_input(
+    "Accumulation threshold (mm)", min_value=0.0, value=20.0, step=1.0
+)
+dry_spell_days = st.sidebar.number_input(
+    "Dry spell length (days)", min_value=1, value=7, step=1
+)
+lookahead_days = st.sidebar.number_input(
+    "Lookahead window (days)", min_value=1, value=21, step=1
 )
 
-use_default_mask = st.sidebar.checkbox("Apply default .nc mask", value=True)
+st.sidebar.subheader("Search window")
+start_month = st.sidebar.selectbox("Search start month", list(range(1, 13)), index=0)
+start_day = st.sidebar.number_input(
+    "Search start day", min_value=1, max_value=31, value=1, step=1
+)
+end_month = st.sidebar.selectbox("Search end month", list(range(1, 13)), index=11)
+end_day = st.sidebar.number_input(
+    "Search end day", min_value=1, max_value=31, value=31, step=1
+)
 
 
-# Helpers: coordinate detection
-def _find_coord_name(ds: xr.Dataset, candidates: List[str]) -> Optional[str]:
+# ─────────────────────────────────────────────
+# Data loading helpers
+# ─────────────────────────────────────────────
+@st.cache_resource
+def open_dataset_folder(folder: str) -> Tuple[xr.Dataset, List[str]]:
+    data_dir = Path(folder).expanduser().resolve()
+    files = sorted(data_dir.glob(FILE_GLOB))
+    if not files:
+        raise FileNotFoundError(f"No {FILE_GLOB} files in {data_dir}")
+    ds_ = xr.open_mfdataset(
+        [str(f) for f in files],
+        combine="by_coords",
+        parallel=True,
+        chunks={"time": CHUNKSIZE},
+        engine=None,
+    )
+    return ds_, [str(f) for f in files]
+
+
+def _find_coord_name(ds, candidates):
     for name in candidates:
-        if name in ds.coords:
-            return name
-        if name in ds.dims:
+        if name in ds.coords or name in ds.dims:
             return name
     return None
 
 
-def guess_lat_lon_time_names(ds: xr.Dataset) -> Tuple[str, str, str]:
-    """
-    Robust coordinate guessing across CHIRPS (latitude/longitude/time)
-    and ENACTS (lat/lon/time).
-    """
-    lat_name = _find_coord_name(ds, ["latitude", "lat", "y"])
-    lon_name = _find_coord_name(ds, ["longitude", "lon", "x"])
-    time_name = _find_coord_name(ds, ["time", "date"])
-
-    if lat_name is None or lon_name is None or time_name is None:
+def guess_lat_lon_time_names(ds):
+    lat = _find_coord_name(ds, ["latitude", "lat", "y"])
+    lon = _find_coord_name(ds, ["longitude", "lon", "x"])
+    time = _find_coord_name(ds, ["time", "date"])
+    if lat is None or lon is None or time is None:
         raise ValueError(
-            "Could not infer lat/lon/time coordinate names. "
-            f"coords={list(ds.coords)}, dims={list(ds.dims)}"
+            f"Cannot infer coords. coords={list(ds.coords)}, dims={list(ds.dims)}"
         )
-    return lat_name, lon_name, time_name
+    return lat, lon, time
 
 
-def maybe_normalize_longitudes(ds: xr.Dataset, lon_name: str) -> xr.Dataset:
-    """If lon is 0..360, convert to -180..180 for easier Ethiopia subsetting."""
+def maybe_normalize_longitudes(ds, lon_name):
     lon = ds[lon_name]
     if np.nanmax(lon.values) > 180:
         new_lon = ((lon + 180) % 360) - 180
@@ -73,240 +114,194 @@ def maybe_normalize_longitudes(ds: xr.Dataset, lon_name: str) -> xr.Dataset:
     return ds
 
 
+@st.cache_data(show_spinner=True)
+def load_emi_station_csv(path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df = pd.read_csv(path, index_col=0)
+    df.index = df.index.astype(str).str.strip()
+    if "LON" not in df.index:
+        raise ValueError("Station CSV missing 'LON' row.")
+    lat_row = (
+        "DAILY/LAT"
+        if "DAILY/LAT" in df.index
+        else ("LAT" if "LAT" in df.index else None)
+    )
+    if lat_row is None:
+        raise ValueError("Station CSV missing latitude row.")
+    lon = df.loc["LON"].astype(float)
+    lat = df.loc[lat_row].astype(float)
+    meta = pd.DataFrame({"lat": lat, "lon": lon})
+    meta.index.name = "station"
+    df_data = df.drop(index=["LON", lat_row])
+    df_data.index = pd.to_datetime(df_data.index, format="%Y%m%d", errors="raise")
+    df_data = df_data.sort_index()
+    ts = (
+        df_data.apply(pd.to_numeric, errors="coerce").replace(-99, np.nan).astype(float)
+    )
+    return meta, ts
+
+
 @st.cache_resource
 def load_default_mask_da() -> xr.DataArray:
-    path = DEFAULT_MASK_NC_PATH
-    if not path.exists():
-        raise FileNotFoundError(f"Default mask file not found: {path}")
-
-    ds = xr.open_dataset(str(path))
-    if len(ds.data_vars) == 0:
-        raise ValueError(f"No data variables found in mask file: {path}")
-
-    mask_var = list(ds.data_vars)[0]
-    return ds[mask_var]
+    if not DEFAULT_MASK_NC_PATH.exists():
+        raise FileNotFoundError(f"Mask not found: {DEFAULT_MASK_NC_PATH}")
+    ds = xr.open_dataset(str(DEFAULT_MASK_NC_PATH))
+    return ds[list(ds.data_vars)[0]]
 
 
-def apply_nc_mask_to_Z(
-    Z: np.ndarray,
-    lat_vals: np.ndarray,
-    lon_vals: np.ndarray,
-    mask_da: xr.DataArray,
-) -> np.ndarray:
-    """
-    SciPy-free nearest-neighbor remap of mask_da onto (lat_vals, lon_vals).
-    Z is (lat, lon). mask_da must have lat/lon coordinates (any names).
-    Assumes mask is 1/True for keep, 0/False for mask-out.
-    """
+def apply_nc_mask_to_Z(Z, lat_vals, lon_vals, mask_da):
     mask_ds = mask_da.to_dataset(name="mask")
-
-    # detect coord names
     if "time" in mask_ds.coords or "time" in mask_ds.dims:
         mlat, mlon, _ = guess_lat_lon_time_names(mask_ds)
     else:
         mlat = _find_coord_name(mask_ds, ["latitude", "lat", "y"])
         mlon = _find_coord_name(mask_ds, ["longitude", "lon", "x"])
-
     if mlat is None or mlon is None:
-        raise ValueError("Could not infer lat/lon names in mask .nc")
-
+        raise ValueError("Cannot infer lat/lon in mask .nc")
     mask_ds = maybe_normalize_longitudes(mask_ds, mlon)
-    mlat_vals = np.asarray(mask_ds[mlat].values)
-    mlon_vals = np.asarray(mask_ds[mlon].values)
-    mask_grid = np.asarray(mask_ds["mask"].values)
+    mlv = np.asarray(mask_ds[mlat].values)
+    mlov = np.asarray(mask_ds[mlon].values)
+    mg = np.asarray(mask_ds["mask"].values)
+    if mg.ndim == 3:
+        mg = mg[0]
+    if mlv[0] > mlv[-1]:
+        mlv = mlv[::-1]
+        mg = mg[::-1, :]
+    if mlov[0] > mlov[-1]:
+        mlov = mlov[::-1]
+        mg = mg[:, ::-1]
 
-    # If mask has time dimension, take the first timestep and squeeze
-    if mask_grid.ndim == 3:
-        mask_grid = mask_grid[0, :, :]
-
-    if mask_grid.ndim != 2:
-        raise ValueError(f"Expected 2D mask grid, got shape {mask_grid.shape}")
-
-    # ensure ascending coords for searchsorted
-    if mlat_vals[0] > mlat_vals[-1]:
-        mlat_vals = mlat_vals[::-1]
-        mask_grid = mask_grid[::-1, :]
-    if mlon_vals[0] > mlon_vals[-1]:
-        mlon_vals = mlon_vals[::-1]
-        mask_grid = mask_grid[:, ::-1]
-
-    def nearest_idx(src: np.ndarray, tgt: np.ndarray) -> np.ndarray:
+    def nearest_idx(src, tgt):
         src = np.asarray(src)
         tgt = np.asarray(tgt)
         if len(src) < 2:
             return np.zeros_like(tgt, dtype=int)
-        idx = np.searchsorted(src, tgt, side="left")
-        idx = np.clip(idx, 1, len(src) - 1)
+        idx = np.clip(np.searchsorted(src, tgt, side="left"), 1, len(src) - 1)
         left = src[idx - 1]
         right = src[idx]
-        choose_left = (tgt - left) <= (right - tgt)
-        return np.where(choose_left, idx - 1, idx)
+        return np.where((tgt - left) <= (right - tgt), idx - 1, idx)
 
-    lat_idx = nearest_idx(mlat_vals, np.asarray(lat_vals))
-    lon_idx = nearest_idx(mlon_vals, np.asarray(lon_vals))
-
-    mask_on_grid = mask_grid[np.ix_(lat_idx, lon_idx)].astype(float)
-    keep = np.isfinite(mask_on_grid) & (mask_on_grid > 0.5)
-    return np.where(keep, Z, np.nan)
+    li = nearest_idx(mlv, np.asarray(lat_vals))
+    lj = nearest_idx(mlov, np.asarray(lon_vals))
+    m2 = mg[np.ix_(li, lj)].astype(float)
+    return np.where(np.isfinite(m2) & (m2 > 0.5), Z, np.nan)
 
 
-def dataset_time_range(
-    ds: xr.Dataset, time_name: str
-) -> Tuple[pd.Timestamp, pd.Timestamp]:
+def dataset_year_range(ds, time_name):
+    y = ds[time_name].dt.year
+    lo = int(y.min().compute()) if hasattr(y.min(), "compute") else int(y.min())
+    hi = int(y.max().compute()) if hasattr(y.max(), "compute") else int(y.max())
+    return lo, hi
+
+
+def dataset_time_range(ds, time_name):
     tmin = pd.to_datetime(ds[time_name].min().compute().values)
     tmax = pd.to_datetime(ds[time_name].max().compute().values)
     return tmin, tmax
 
 
-def dataset_year_range(ds: xr.Dataset, time_name: str) -> Tuple[int, int]:
-    years = ds[time_name].dt.year
-    y_min = (
-        int(years.min().compute())
-        if hasattr(years.min(), "compute")
-        else int(years.min())
-    )
-    y_max = (
-        int(years.max().compute())
-        if hasattr(years.max(), "compute")
-        else int(years.max())
-    )
-    return y_min, y_max
-
-# ICPAC onset definition
+# ─────────────────────────────────────────────
+# Onset / wet spell detection
+# ─────────────────────────────────────────────
 def detect_onset(
-    dates: pd.Series,
-    rain: np.ndarray,
-    wet_day_mm: float,
-    accum_days: int,
-    accum_mm: float,
-    dry_spell_days: int,
-    lookahead_days: int,
-    start_month: int,
-    start_day: int,
-    end_month: int,
-    end_day: int,
-) -> Tuple[Optional[pd.Timestamp], Optional[int]]:
+    dates,
+    rain,
+    wet_day_mm,
+    accum_days,
+    accum_mm,
+    dry_spell_days,
+    lookahead_days,
+    start_month,
+    start_day,
+    end_month,
+    end_day,
+):
     r = np.asarray(rain, dtype=float)
     d = pd.to_datetime(dates).reset_index(drop=True)
-
-    if len(r) != len(d):
-        raise ValueError("dates and rain must be same length")
-
     wet = r >= wet_day_mm
-
     year = int(d.iloc[0].year)
-    start_date = pd.Timestamp(year=year, month=start_month, day=start_day)
-    end_date = pd.Timestamp(year=year, month=end_month, day=end_day)
-
-    start_idx = int(np.searchsorted(d.values, np.datetime64(start_date)))
-    end_idx = int(np.searchsorted(d.values, np.datetime64(end_date), side="right"))
-
+    t0 = pd.Timestamp(year=year, month=start_month, day=start_day)
+    t1 = pd.Timestamp(year=year, month=end_month, day=end_day)
+    si = int(np.searchsorted(d.values, np.datetime64(t0)))
+    ei = int(np.searchsorted(d.values, np.datetime64(t1), side="right"))
     n = len(r)
-    last_t = n - accum_days - lookahead_days
-    if last_t <= start_idx:
+    last = n - accum_days - lookahead_days
+    if last <= si:
         return None, None
-
-    t_stop = min(last_t, end_idx)
-    if t_stop <= start_idx:
+    stop = min(last, ei)
+    if stop <= si:
         return None, None
-
-    for t in range(start_idx, t_stop):
-        window = r[t : t + accum_days]
-        if np.nansum(window) >= accum_mm and np.all(window >= wet_day_mm):
-            future_wet = wet[t + accum_days : t + accum_days + lookahead_days]
-            dry_run = 0
-            ok = True
-            for is_wet in future_wet:
-                if not is_wet:
+    for t in range(si, stop):
+        win = r[t : t + accum_days]
+        if np.nansum(win) >= accum_mm and np.all(win >= wet_day_mm):
+            fut = wet[t + accum_days : t + accum_days + lookahead_days]
+            dry_run, ok = 0, True
+            for w in fut:
+                if not w:
                     dry_run += 1
                     if dry_run >= dry_spell_days:
                         ok = False
                         break
                 else:
                     dry_run = 0
-
             if ok:
                 return d.iloc[t], t
-
     return None, None
 
 
 def detect_first_wet_spell(
-    dates: pd.Series,
-    rain: np.ndarray,
-    wet_day_mm: float,
-    accum_days: int,
-    accum_mm: float,
-    start_month: int,
-    start_day: int,
-    end_month: int,
-    end_day: int,
-) -> Tuple[Optional[pd.Timestamp], Optional[int]]:
+    dates,
+    rain,
+    wet_day_mm,
+    accum_days,
+    accum_mm,
+    start_month,
+    start_day,
+    end_month,
+    end_day,
+):
     r = np.asarray(rain, dtype=float)
     d = pd.to_datetime(dates).reset_index(drop=True)
-
     year = int(d.iloc[0].year)
-    start_date = pd.Timestamp(year=year, month=start_month, day=start_day)
-    end_date = pd.Timestamp(year=year, month=end_month, day=end_day)
-
-    start_idx = int(np.searchsorted(d.values, np.datetime64(start_date)))
-    end_idx = int(np.searchsorted(d.values, np.datetime64(end_date), side="right"))
-
-    n = len(r)
-    last_t = n - accum_days
-    t_stop = min(last_t + 1, end_idx)
-
-    for t in range(start_idx, max(start_idx, t_stop)):
-        window = r[t : t + accum_days]
-        if np.nansum(window) < accum_mm:
-            continue
-        if np.any(window < wet_day_mm):
-            continue
-        return d.iloc[t], t
-
+    t0 = pd.Timestamp(year=year, month=start_month, day=start_day)
+    t1 = pd.Timestamp(year=year, month=end_month, day=end_day)
+    si = int(np.searchsorted(d.values, np.datetime64(t0)))
+    ei = int(np.searchsorted(d.values, np.datetime64(t1), side="right"))
+    stop = min(len(r) - accum_days + 1, ei)
+    for t in range(si, max(si, stop)):
+        win = r[t : t + accum_days]
+        if np.nansum(win) >= accum_mm and not np.any(win < wet_day_mm):
+            return d.iloc[t], t
     return None, None
 
 
-def wet_spell_start_from_idx(
-    dates: pd.Series,
-    rain: np.ndarray,
-    idx: Optional[int],
-    wet_day_mm: float,
-) -> Optional[pd.Timestamp]:
+def wet_spell_start_from_idx(dates, rain, idx, wet_day_mm):
     if idx is None:
         return None
-
     r = np.asarray(rain, dtype=float)
     d = pd.to_datetime(dates).reset_index(drop=True)
-
     if idx < 0 or idx >= len(r):
         return None
-
     if r[idx] < wet_day_mm:
         return d.iloc[idx]
-
     j = idx
     while j - 1 >= 0 and r[j - 1] >= wet_day_mm:
         j -= 1
     return d.iloc[j]
 
-# Ethiopia boundary helpers
+
+# ─────────────────────────────────────────────
+# Ethiopia boundary
+# ─────────────────────────────────────────────
 @st.cache_resource
-def load_ethiopia_boundary() -> gpd.GeoDataFrame:
-    path = Path("data/ethiopia.geojson")
-    if not path.exists():
+def load_ethiopia_boundary():
+    p = Path("data/ethiopia.geojson")
+    if not p.exists():
         raise FileNotFoundError("data/ethiopia.geojson not found")
-    eth = gpd.read_file(path).to_crs("EPSG:4326")
-    return eth.dissolve()
+    return gpd.read_file(p).to_crs("EPSG:4326").dissolve()
 
 
-def make_inside_mask(
-    lat_vals: np.ndarray, lon_vals: np.ndarray, eth_geom
-) -> np.ndarray:
-    lat_vals = np.asarray(lat_vals)
-    lon_vals = np.asarray(lon_vals)
+def make_inside_mask(lat_vals, lon_vals, eth_geom):
     g = prep(eth_geom)
-
     try:
         from shapely import contains_xy
 
@@ -319,8 +314,11 @@ def make_inside_mask(
                 mask[i, j] = g.contains(Point(float(lo), float(la)))
         return mask
 
-# JJAS DOY colormap (May-Sep)
-def build_jjas_doy_cmap() -> Tuple[ListedColormap, BoundaryNorm, List[int], List[str]]:
+
+# ─────────────────────────────────────────────
+# JJAS DOY colormap
+# ─────────────────────────────────────────────
+def build_jjas_doy_cmap():
     month_doys = {
         "May": (121, 151),
         "Jun": (152, 181),
@@ -335,24 +333,16 @@ def build_jjas_doy_cmap() -> Tuple[ListedColormap, BoundaryNorm, List[int], List
         "Aug": plt.cm.BuPu,
         "Sep": plt.cm.RdPu,
     }
-
-    colors = []
-    bounds = []
-    N_per_month = 8
-
-    for month in ["May", "Jun", "Jul", "Aug", "Sep"]:
-        d0, d1 = month_doys[month]
-        cmap = month_cmaps[month]
-        ramp = cmap(np.linspace(0.35, 0.95, N_per_month))
-        colors.extend(ramp)
-        bounds.extend(np.linspace(d0, d1, N_per_month, endpoint=False))
-
+    colors, bounds = [], []
+    N = 8
+    for m in ["May", "Jun", "Jul", "Aug", "Sep"]:
+        d0, d1 = month_doys[m]
+        colors.extend(month_cmaps[m](np.linspace(0.35, 0.95, N)))
+        bounds.extend(np.linspace(d0, d1, N, endpoint=False))
     bounds.append(month_doys["Sep"][1])
-
-    cmap_jjas = ListedColormap(colors, name="JJAS_piecewise")
-    norm_jjas = BoundaryNorm(bounds, cmap_jjas.N)
-
-    tick_positions = [
+    cmap = ListedColormap(colors, name="JJAS_piecewise")
+    norm = BoundaryNorm(bounds, cmap.N)
+    tpos = [
         121,
         128,
         136,
@@ -374,7 +364,7 @@ def build_jjas_doy_cmap() -> Tuple[ListedColormap, BoundaryNorm, List[int], List
         258,
         265,
     ]
-    tick_labels = [
+    tlbl = [
         "May 01",
         "May 08",
         "May 16",
@@ -396,1055 +386,1202 @@ def build_jjas_doy_cmap() -> Tuple[ListedColormap, BoundaryNorm, List[int], List
         "Sep 15",
         "Sep 22",
     ]
-    return cmap_jjas, norm_jjas, tick_positions, tick_labels
+    return cmap, norm, tpos, tlbl
 
 
-# Year-range aggregation maps
-AggMode = Literal["Median", "Mean"]
+# ─────────────────────────────────────────────
+# Cached extraction helpers
+# ─────────────────────────────────────────────
+@st.cache_data(show_spinner=True)
+def extract_series_single_year(
+    dataset_key, ds_files, lat_name, lon_name, time_name, year, lat0, lon0
+):
+    ds = xr.open_mfdataset(
+        ds_files,
+        combine="by_coords",
+        parallel=True,
+        chunks={time_name: 365},
+        engine=None,
+    )
+    ds = maybe_normalize_longitudes(ds, lon_name)
+    da = ds[RAIN_VAR].sel({time_name: slice(f"{year}-01-01", f"{year}-12-31")})
+    da = da.sel({lat_name: lat0, lon_name: lon0}, method="nearest").compute()
+    p_lat = float(da[lat_name].values)
+    p_lon = float(da[lon_name].values)
+    df = da.to_dataframe(name="rain").reset_index()
+    df[time_name] = pd.to_datetime(df[time_name])
+    df = (
+        df.rename(columns={time_name: "time"})
+        .sort_values("time")
+        .reset_index(drop=True)
+    )
+    df["dataset"] = dataset_key
+    df["snapped_lat"] = p_lat
+    df["snapped_lon"] = p_lon
+    return df
+
+
+@st.cache_data(show_spinner=True)
+def extract_climatology(
+    dataset_key, ds_files, lat_name, lon_name, time_name, y0, y1, lat0, lon0, agg_mode
+):
+    ds = xr.open_mfdataset(
+        ds_files,
+        combine="by_coords",
+        parallel=True,
+        chunks={time_name: 365},
+        engine=None,
+    )
+    ds = maybe_normalize_longitudes(ds, lon_name)
+    da = ds[RAIN_VAR].sel({time_name: slice(f"{y0}-01-01", f"{y1}-12-31")})
+    da = da.sel({lat_name: lat0, lon_name: lon0}, method="nearest").compute()
+    p_lat = float(da[lat_name].values)
+    p_lon = float(da[lon_name].values)
+    doy = da[time_name].dt.dayofyear
+    clim = (
+        da.groupby(doy).mean(dim=time_name, skipna=True)
+        if agg_mode == "Mean"
+        else da.groupby(doy).median(dim=time_name, skipna=True)
+    )
+    dv = clim[doy.name].values.astype(int)
+    rv = clim.values
+    keep = dv <= 365
+    dv, rv = dv[keep], rv[keep]
+    dates = pd.to_datetime("2001-01-01") + pd.to_timedelta(dv - 1, unit="D")
+    return pd.DataFrame(
+        {
+            "time": dates,
+            "rain": rv,
+            "dataset": dataset_key,
+            "snapped_lat": p_lat,
+            "snapped_lon": p_lon,
+        }
+    )
+
+
+# ─────────────────────────────────────────────
+# Map computation
+# ─────────────────────────────────────────────
+@st.cache_data(show_spinner=True)
+def compute_single_year_doy_maps(
+    ds_files,
+    var,
+    lat_name,
+    lon_name,
+    time_name,
+    year,
+    wet_day_mm,
+    accum_days,
+    accum_mm,
+    dry_spell_days,
+    lookahead_days,
+    start_month,
+    start_day,
+    end_month,
+    end_day,
+):
+    ds = xr.open_mfdataset(
+        ds_files,
+        combine="by_coords",
+        parallel=True,
+        chunks={time_name: 365},
+        engine=None,
+    )
+    ds = maybe_normalize_longitudes(ds, lon_name)
+    da = ds[var].sel({time_name: slice(f"{year}-01-01", f"{year}-12-31")}).compute()
+    lv = da[lat_name].values
+    lov = da[lon_name].values
+    R = da.values
+    times = pd.to_datetime(da[time_name].values)
+    wm = np.full((len(lv), len(lov)), np.nan)
+    om = np.full((len(lv), len(lov)), np.nan)
+    for i in range(R.shape[1]):
+        for j in range(R.shape[2]):
+            rij = R[:, i, j]
+            _, wi = detect_first_wet_spell(
+                pd.Series(times),
+                rij,
+                float(wet_day_mm),
+                int(accum_days),
+                float(accum_mm),
+                int(start_month),
+                int(start_day),
+                int(end_month),
+                int(end_day),
+            )
+            ws = wet_spell_start_from_idx(pd.Series(times), rij, wi, float(wet_day_mm))
+            if ws is not None:
+                wm[i, j] = float(pd.Timestamp(ws).dayofyear)
+            od, _ = detect_onset(
+                pd.Series(times),
+                rij,
+                float(wet_day_mm),
+                int(accum_days),
+                float(accum_mm),
+                int(dry_spell_days),
+                int(lookahead_days),
+                int(start_month),
+                int(start_day),
+                int(end_month),
+                int(end_day),
+            )
+            if od is not None:
+                om[i, j] = float(pd.Timestamp(od).dayofyear)
+    return lv, lov, np.rint(wm), np.rint(om)
+
 
 @st.cache_data(show_spinner=True)
 def compute_agg_doy_maps(
-    ds_path_list: List[str],
-    var: str,
-    lat_name: str,
-    lon_name: str,
-    time_name: str,
-    y0: int,
-    y1: int,
-    agg_mode: AggMode,
-    wet_day_mm: float,
-    accum_days: int,
-    accum_mm: float,
-    dry_spell_days: int,
-    lookahead_days: int,
-    start_month: int,
-    start_day: int,
-    end_month: int,
-    end_day: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ds_files,
+    var,
+    lat_name,
+    lon_name,
+    time_name,
+    y0,
+    y1,
+    agg_mode,
+    wet_day_mm,
+    accum_days,
+    accum_mm,
+    dry_spell_days,
+    lookahead_days,
+    start_month,
+    start_day,
+    end_month,
+    end_day,
+):
     ds = xr.open_mfdataset(
-        ds_path_list,
+        ds_files,
         combine="by_coords",
         parallel=True,
         chunks={time_name: 365},
         engine=None,
     )
     ds = maybe_normalize_longitudes(ds, lon_name)
-
     da_all = ds[var].sel({time_name: slice(f"{y0}-01-01", f"{y1}-12-31")})
-    lat_vals = da_all[lat_name].values
-    lon_vals = da_all[lon_name].values
-
-    years = np.arange(y0, y1 + 1, dtype=int)
-    wet_doy_yearly = []
-    onset_doy_yearly = []
-
-    for yy in years:
-        da_y = da_all.sel({time_name: slice(f"{yy}-01-01", f"{yy}-12-31")}).compute()
-        R = da_y.values  # (time, lat, lon)
-        times = pd.to_datetime(da_y[time_name].values)
-
-        wet_map = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=float)
-        onset_map = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=float)
-
+    lv = da_all[lat_name].values
+    lov = da_all[lon_name].values
+    wl, ol = [], []
+    for yy in range(y0, y1 + 1):
+        da = da_all.sel({time_name: slice(f"{yy}-01-01", f"{yy}-12-31")}).compute()
+        R = da.values
+        times = pd.to_datetime(da[time_name].values)
+        wm = np.full((len(lv), len(lov)), np.nan)
+        om = np.full((len(lv), len(lov)), np.nan)
         for i in range(R.shape[1]):
             for j in range(R.shape[2]):
-                rain_ij = R[:, i, j]
-
-                wet_cand_date, wet_cand_idx = detect_first_wet_spell(
-                    dates=pd.Series(times),
-                    rain=rain_ij,
-                    wet_day_mm=float(wet_day_mm),
-                    accum_days=int(accum_days),
-                    accum_mm=float(accum_mm),
-                    start_month=int(start_month),
-                    start_day=int(start_day),
-                    end_month=int(end_month),
-                    end_day=int(end_day),
+                rij = R[:, i, j]
+                _, wi = detect_first_wet_spell(
+                    pd.Series(times),
+                    rij,
+                    float(wet_day_mm),
+                    int(accum_days),
+                    float(accum_mm),
+                    int(start_month),
+                    int(start_day),
+                    int(end_month),
+                    int(end_day),
                 )
-                wet_start = wet_spell_start_from_idx(
-                    dates=pd.Series(times),
-                    rain=rain_ij,
-                    idx=wet_cand_idx,
-                    wet_day_mm=float(wet_day_mm),
+                ws = wet_spell_start_from_idx(
+                    pd.Series(times), rij, wi, float(wet_day_mm)
                 )
-                if wet_start is not None:
-                    wet_map[i, j] = float(pd.Timestamp(wet_start).dayofyear)
-
-                onset_date, _ = detect_onset(
-                    dates=pd.Series(times),
-                    rain=rain_ij,
-                    wet_day_mm=float(wet_day_mm),
-                    accum_days=int(accum_days),
-                    accum_mm=float(accum_mm),
-                    dry_spell_days=int(dry_spell_days),
-                    lookahead_days=int(lookahead_days),
-                    start_month=int(start_month),
-                    start_day=int(start_day),
-                    end_month=int(end_month),
-                    end_day=int(end_day),
+                if ws is not None:
+                    wm[i, j] = float(pd.Timestamp(ws).dayofyear)
+                od, _ = detect_onset(
+                    pd.Series(times),
+                    rij,
+                    float(wet_day_mm),
+                    int(accum_days),
+                    float(accum_mm),
+                    int(dry_spell_days),
+                    int(lookahead_days),
+                    int(start_month),
+                    int(start_day),
+                    int(end_month),
+                    int(end_day),
                 )
-                if onset_date is not None:
-                    onset_map[i, j] = float(pd.Timestamp(onset_date).dayofyear)
-
-        wet_doy_yearly.append(wet_map)
-        onset_doy_yearly.append(onset_map)
-
-    wet_doy_yearly = np.stack(wet_doy_yearly, axis=0)
-    onset_doy_yearly = np.stack(onset_doy_yearly, axis=0)
-
-    if agg_mode == "Median":
-        agg_wet = np.nanmedian(wet_doy_yearly, axis=0)
-        agg_onset = np.nanmedian(onset_doy_yearly, axis=0)
-    else:
-        agg_wet = np.nanmean(wet_doy_yearly, axis=0)
-        agg_onset = np.nanmean(onset_doy_yearly, axis=0)
-
-    agg_wet = np.rint(agg_wet)
-    agg_onset = np.rint(agg_onset)
-
-    season_min, season_max = 121, 265
-    agg_wet = np.where(
-        (agg_wet >= season_min) & (agg_wet <= season_max), agg_wet, np.nan
+                if od is not None:
+                    om[i, j] = float(pd.Timestamp(od).dayofyear)
+        wl.append(wm)
+        ol.append(om)
+    ws_stk = np.stack(wl, axis=0)
+    os_stk = np.stack(ol, axis=0)
+    aw = (
+        np.nanmedian(ws_stk, axis=0)
+        if agg_mode == "Median"
+        else np.nanmean(ws_stk, axis=0)
     )
-    agg_onset = np.where(
-        (agg_onset >= season_min) & (agg_onset <= season_max), agg_onset, np.nan
+    ao = (
+        np.nanmedian(os_stk, axis=0)
+        if agg_mode == "Median"
+        else np.nanmean(os_stk, axis=0)
+    )
+    s0, s1 = 121, 265
+    aw = np.where((np.rint(aw) >= s0) & (np.rint(aw) <= s1), np.rint(aw), np.nan)
+    ao = np.where((np.rint(ao) >= s0) & (np.rint(ao) <= s1), np.rint(ao), np.nan)
+    return lv, lov, aw, ao
+
+
+def clip_and_mask_map(Z, lat_vals, lon_vals, eth_geom, eth_bounds, mask_da):
+    lo_mn, la_mn, lo_mx, la_mx = eth_bounds
+    lat_sel = (lat_vals >= la_mn) & (lat_vals <= la_mx)
+    lon_sel = (lon_vals >= lo_mn) & (lon_vals <= lo_mx)
+    Z = Z[np.ix_(lat_sel, lon_sel)]
+    lat_vals = lat_vals[lat_sel]
+    lon_vals = lon_vals[lon_sel]
+    inside = make_inside_mask(lat_vals, lon_vals, eth_geom)
+    Z = np.where(inside, Z, np.nan)
+    if mask_da is not None:
+        Z = apply_nc_mask_to_Z(Z, lat_vals, lon_vals, mask_da)
+    return lat_vals, lon_vals, Z
+
+
+def _nanminmax(a):
+    fin = a[np.isfinite(a)]
+    if len(fin) == 0:
+        return 0.0, 1.0
+    lo, hi = float(fin.min()), float(fin.max())
+    return (lo, hi) if lo != hi else (lo, lo + 1e-6)
+
+
+# ─────────────────────────────────────────────
+# Map plot helpers (matplotlib — maps stay static)
+# ─────────────────────────────────────────────
+def plot_doy_map(
+    ax, Lon, Lat, Z, eth, title, cb_label, cmap_jjas, norm_jjas, tpos, tlbl, fig
+):
+    pcm = ax.pcolormesh(Lon, Lat, Z, shading="auto", cmap=cmap_jjas, norm=norm_jjas)
+    eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+    ax.set_title(title, fontsize=9)
+    ax.set_xlabel("Lon")
+    ax.set_ylabel("Lat")
+    cb = fig.colorbar(pcm, ax=ax)
+    cb.set_label(cb_label, fontsize=8)
+    cb.set_ticks(tpos)
+    cb.set_ticklabels(tlbl, fontsize=6)
+
+
+def plot_rain_map(
+    ax, Lon, Lat, Z, eth, title, cb_label, fig, vmin=None, vmax=None, cmap="Blues"
+):
+    if vmin is None or vmax is None:
+        vmin, vmax = _nanminmax(Z)
+    pcm = ax.pcolormesh(Lon, Lat, Z, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+    eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
+    ax.set_title(title, fontsize=9)
+    ax.set_xlabel("Lon")
+    ax.set_ylabel("Lat")
+    cb = fig.colorbar(pcm, ax=ax)
+    cb.set_label(cb_label, fontsize=8)
+
+
+# ─────────────────────────────────────────────
+# Plotly timeseries helpers (interactive legend)
+# ─────────────────────────────────────────────
+def build_plotly_ts(title: str) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        title=title,
+        xaxis_title="Date",
+        yaxis_title="Rainfall (mm/day)",
+        legend=dict(
+            orientation="v",
+            x=1.01,
+            xanchor="left",
+            y=1,
+            bgcolor="rgba(0,0,0,0)",
+            bordercolor="white",
+            borderwidth=1,
+            itemclick="toggle",
+            itemdoubleclick="toggleothers",
+            font=dict(color="white", size=13),
+        ),
+        hovermode="x unified",
+        height=500,
+        margin=dict(r=280),
+        yaxis2=dict(
+            overlaying="y",
+            range=[0, 1],
+            showticklabels=False,
+            showgrid=False,
+            zeroline=False,
+            fixedrange=True,
+        ),
+    )
+    return fig
+
+
+def add_rain_trace(fig, times, rain_vals, label, color, show_markers=True):
+    fig.add_trace(
+        go.Scatter(
+            x=list(times),
+            y=list(rain_vals),
+            mode="lines+markers" if show_markers else "lines",
+            name=label,
+            line=dict(color=color, width=1.4),
+            marker=dict(size=3, color=color) if show_markers else dict(),
+            hovertemplate="%{y:.2f} mm<extra>" + label + "</extra>",
+        )
     )
 
-    return lat_vals, lon_vals, agg_wet, agg_onset
 
-@st.cache_data(show_spinner=True)
-def compute_single_year_doy_maps(
-    ds_path_list: List[str],
-    var: str,
-    lat_name: str,
-    lon_name: str,
-    time_name: str,
-    year: int,
-    wet_day_mm: float,
-    accum_days: int,
-    accum_mm: float,
-    dry_spell_days: int,
-    lookahead_days: int,
-    start_month: int,
-    start_day: int,
-    end_month: int,
-    end_day: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    ds = xr.open_mfdataset(
-        ds_path_list,
-        combine="by_coords",
-        parallel=True,
-        chunks={time_name: 365},
-        engine=None,
+def add_wetspell_onset_traces(fig, df_ts, dataset_key, label_prefix):
+    """Add wet spell start and onset as toggleable vertical line traces."""
+    colors = DATASET_COLORS.get(dataset_key, {"wet": "gray", "onset": "black"})
+    times = df_ts["time"]
+    rain = df_ts["rain"].values
+
+    # guard: need at least one non-NaN value
+    if not np.any(np.isfinite(rain)):
+        return
+
+    _, wi = detect_first_wet_spell(
+        times,
+        rain,
+        float(wet_day_mm),
+        int(accum_days),
+        float(accum_mm),
+        int(start_month),
+        int(start_day),
+        int(end_month),
+        int(end_day),
     )
-    ds = maybe_normalize_longitudes(ds, lon_name)
+    ws = wet_spell_start_from_idx(times, rain, wi, float(wet_day_mm))
 
-    da_y = ds[var].sel({time_name: slice(f"{year}-01-01", f"{year}-12-31")}).compute()
+    od, _ = detect_onset(
+        times,
+        rain,
+        float(wet_day_mm),
+        int(accum_days),
+        float(accum_mm),
+        int(dry_spell_days),
+        int(lookahead_days),
+        int(start_month),
+        int(start_day),
+        int(end_month),
+        int(end_day),
+    )
 
-    lat_vals = da_y[lat_name].values
-    lon_vals = da_y[lon_name].values
-
-    R = da_y.values
-    times = pd.to_datetime(da_y[time_name].values)
-
-    wet_map = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=float)
-    onset_map = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=float)
-
-    for i in range(R.shape[1]):
-        for j in range(R.shape[2]):
-            rain_ij = R[:, i, j]
-
-            wet_cand_date, wet_cand_idx = detect_first_wet_spell(
-                dates=pd.Series(times),
-                rain=rain_ij,
-                wet_day_mm=float(wet_day_mm),
-                accum_days=int(accum_days),
-                accum_mm=float(accum_mm),
-                start_month=int(start_month),
-                start_day=int(start_day),
-                end_month=int(end_month),
-                end_day=int(end_day),
+    if ws is not None:
+        lbl = f"{label_prefix} wet spell ({ws.strftime('%d %b')})"
+        fig.add_trace(
+            go.Scatter(
+                x=[ws, ws],
+                y=[0, 1],
+                mode="lines",
+                name=lbl,
+                line=dict(color=colors["wet"], width=2, dash="dash"),
+                yaxis="y2",
+                hovertemplate=f"Wet spell start: {ws.date()}<extra></extra>",
+                showlegend=True,
             )
-            wet_start = wet_spell_start_from_idx(
-                dates=pd.Series(times),
-                rain=rain_ij,
-                idx=wet_cand_idx,
-                wet_day_mm=float(wet_day_mm),
+        )
+
+    if od is not None:
+        lbl = f"{label_prefix} onset ({od.strftime('%d %b')})"
+        fig.add_trace(
+            go.Scatter(
+                x=[od, od],
+                y=[0, 1],
+                mode="lines",
+                name=lbl,
+                line=dict(color=colors["onset"], width=2.5, dash="solid"),
+                yaxis="y2",
+                hovertemplate=f"Onset: {od.date()}<extra></extra>",
+                showlegend=True,
             )
-            if wet_start is not None:
-                wet_map[i, j] = float(pd.Timestamp(wet_start).dayofyear)
+        )
 
-            onset_date, _ = detect_onset(
-                dates=pd.Series(times),
-                rain=rain_ij,
-                wet_day_mm=float(wet_day_mm),
-                accum_days=int(accum_days),
-                accum_mm=float(accum_mm),
-                dry_spell_days=int(dry_spell_days),
-                lookahead_days=int(lookahead_days),
-                start_month=int(start_month),
-                start_day=int(start_day),
-                end_month=int(end_month),
-                end_day=int(end_day),
-            )
-            if onset_date is not None:
-                onset_map[i, j] = float(pd.Timestamp(onset_date).dayofyear)
 
-    wet_map = np.rint(wet_map)
-    onset_map = np.rint(onset_map)
-
-    return lat_vals, lon_vals, wet_map, onset_map
-
-# Streamlit
-st.title("Rainfall Onset Explorer (Ethiopia)")
-
-# Dataset selection UI
-st.subheader("Dataset selection")
-selected_datasets = st.multiselect(
-    "Choose dataset(s) to use",
-    options=list(DATASET_FOLDERS.keys()),
-    default=["CHIRPS"],
-)
-
-if not selected_datasets:
-    st.warning("Select at least one dataset to proceed.")
-    st.stop()
-
-# Load datasets
-@st.cache_resource
-def open_dataset_folder(folder: str) -> Tuple[xr.Dataset, List[str]]:
-    data_dir = Path(folder).expanduser().resolve()
-    files = sorted(data_dir.glob(FILE_GLOB))
-    if not files:
-        raise FileNotFoundError(f"No {FILE_GLOB} files matched in {data_dir}")
-    ds_ = xr.open_mfdataset(
-        [str(f) for f in files],
-        combine="by_coords",
-        parallel=True,
-        chunks={"time": CHUNKSIZE},
-        engine=None,
+def add_wet_threshold_trace(fig, wet_thresh, times):
+    t0 = times.iloc[0] if hasattr(times, "iloc") else times[0]
+    t1 = times.iloc[-1] if hasattr(times, "iloc") else times[-1]
+    fig.add_trace(
+        go.Scatter(
+            x=[t0, t1],
+            y=[wet_thresh, wet_thresh],
+            mode="lines",
+            name=f"Wet threshold ({wet_thresh:g} mm/day)",
+            line=dict(color="gray", width=1.2, dash="dot"),
+            hoverinfo="skip",
+        )
     )
-    return ds_, [str(f) for f in files]
 
 
+# ─────────────────────────────────────────────
+# Dataset registry
+# ─────────────────────────────────────────────
 DS_BY_KEY: Dict[str, xr.Dataset] = {}
 FILES_BY_KEY: Dict[str, List[str]] = {}
 COORDS_BY_KEY: Dict[str, Tuple[str, str, str]] = {}
 
-for key in selected_datasets:
-    folder = DATASET_FOLDERS[key]
-    ds_i, files_i = open_dataset_folder(folder)
-    lat_i, lon_i, time_i = guess_lat_lon_time_names(ds_i)
-    ds_i = maybe_normalize_longitudes(ds_i, lon_i)
 
+def ensure_grid_loaded(key: str):
+    if key in DS_BY_KEY:
+        return
+    ds_i, fi = open_dataset_folder(DATASET_FOLDERS[key])
+    la, lo, ti = guess_lat_lon_time_names(ds_i)
+    ds_i = maybe_normalize_longitudes(ds_i, lo)
     DS_BY_KEY[key] = ds_i
-    FILES_BY_KEY[key] = files_i
-    COORDS_BY_KEY[key] = (lat_i, lon_i, time_i)
+    FILES_BY_KEY[key] = fi
+    COORDS_BY_KEY[key] = (la, lo, ti)
 
-st.caption("Loaded: " + ", ".join(selected_datasets))
-st.caption(f"Using rainfall variable: `{RAIN_VAR}`")
 
-# Compute shared UI ranges
+# ═════════════════════════════════════════════
+# APP STARTS
+# ═════════════════════════════════════════════
+st.title("Rainfall Onset Explorer — Ethiopia")
+
+# ── ① Dataset selection ──
+st.subheader("① Select dataset(s)")
+selected_datasets = st.multiselect(
+    "Choose dataset(s)",
+    options=list(DATASET_FOLDERS.keys()) + [STATION_KEY],
+    default=["CHIRPS"],
+)
+if not selected_datasets:
+    st.warning("Please select at least one dataset to continue.")
+    st.stop()
+
+has_chirps = "CHIRPS" in selected_datasets
+has_enacts = "ENACTS" in selected_datasets
+has_station = STATION_KEY in selected_datasets
+selected_grids = [k for k in selected_datasets if k in DATASET_FOLDERS]
+
+for key in selected_grids:
+    ensure_grid_loaded(key)
+
+emi_meta: Optional[pd.DataFrame] = None
+emi_ts: Optional[pd.DataFrame] = None
+if has_station:
+    if not STATION_CSV_PATH.exists():
+        st.error(f"EMI Stations selected but file not found: {STATION_CSV_PATH.name}")
+        st.stop()
+    emi_meta, emi_ts = load_emi_station_csv(STATION_CSV_PATH)
+
+# ── Shared year range ──
 year_ranges = []
-time_ranges = []
-lat_ranges = []
-lon_ranges = []
+for key in selected_grids:
+    _, _, ti = COORDS_BY_KEY[key]
+    year_ranges.append(dataset_year_range(DS_BY_KEY[key], ti))
+if has_station and emi_ts is not None:
+    year_ranges.append((int(emi_ts.index.min().year), int(emi_ts.index.max().year)))
 
-for key in selected_datasets:
-    ds_i = DS_BY_KEY[key]
-    lat_i, lon_i, time_i = COORDS_BY_KEY[key]
-
-    y_min, y_max = dataset_year_range(ds_i, time_i)
-    tmin, tmax = dataset_time_range(ds_i, time_i)
-
-    year_ranges.append((y_min, y_max))
-    time_ranges.append((tmin, tmax))
-
-    lat_ranges.append(
-        (float(ds_i[lat_i].min().compute()), float(ds_i[lat_i].max().compute()))
-    )
-    lon_ranges.append(
-        (float(ds_i[lon_i].min().compute()), float(ds_i[lon_i].max().compute()))
-    )
+if not year_ranges:
+    st.error("No data available.")
+    st.stop()
 
 year_min = max(r[0] for r in year_ranges)
 year_max = min(r[1] for r in year_ranges)
 if year_min > year_max:
     st.error("Selected datasets have no overlapping years.")
     st.stop()
+
 year_list = list(range(year_min, year_max + 1))
+year_default = min(max(2000, year_min), year_max)
 
-tmin_common = max(r[0] for r in time_ranges)
-tmax_common = min(r[1] for r in time_ranges)
-
-lat_min = max(r[0] for r in lat_ranges)
-lat_max = min(r[1] for r in lat_ranges)
-lon_min = max(r[0] for r in lon_ranges)
-lon_max = min(r[1] for r in lon_ranges)
-
-st.caption(
-    f"Shared domain across selection: "
-    f"Lat {lat_min:.2f}° to {lat_max:.2f}°, Lon {lon_min:.2f}° to {lon_max:.2f}°; "
-    f"Years {year_min}–{year_max}"
-)
-
-# View mode
-st.subheader("View mode")
-mode = st.radio(
-    "Choose a view", ["Point timeseries", "Map (Ethiopia)"], horizontal=True
-)
-
-# Point selection
-st.subheader("Point selection")
-c2, c3, c4 = st.columns([1, 1, 1])
-
-with c2:
-    lat0 = st.number_input(
-        "Latitude (decimal degrees)",
-        min_value=float(lat_min),
-        max_value=float(lat_max),
-        value=float(np.clip(10.0, lat_min, lat_max)),
-        format="%.4f",
-        step=0.25,
-    )
-
-with c3:
-    lon0 = st.number_input(
-        "Longitude (decimal degrees)",
-        min_value=float(lon_min),
-        max_value=float(lon_max),
-        value=float(np.clip(40.0, lon_min, lon_max)),
-        format="%.4f",
-        step=0.05,
-    )
-
-with c4:
-    year = st.selectbox(
-        "Year (for point timeseries + daily map)",
-        options=year_list,
-        index=year_list.index(min(max(2000, year_min), year_max)),
-    )
-
-
-# Parameters
-st.sidebar.header("Onset / Wet spell parameters")
-
-wet_day_mm = st.sidebar.number_input(
-    "Wet day threshold (mm/day)", min_value=0.0, value=1.0, step=0.1
-)
-accum_days = st.sidebar.number_input(
-    "Accumulation window (days)", min_value=1, value=3, step=1
-)
-accum_mm = st.sidebar.number_input(
-    "Accumulation threshold (mm)", min_value=0.0, value=20.0, step=1.0
-)
-dry_spell_days = st.sidebar.number_input(
-    "Dry spell length (days)", min_value=1, value=7, step=1
-)
-lookahead_days = st.sidebar.number_input(
-    "Lookahead window (days)", min_value=1, value=21, step=1
-)
-
-st.sidebar.subheader("Search window (within selected year)")
-start_month = st.sidebar.selectbox("Search start month", list(range(1, 13)), index=4)
-start_day = st.sidebar.number_input(
-    "Search start day", min_value=1, max_value=31, value=15, step=1
-)
-end_month = st.sidebar.selectbox("Search end month", list(range(1, 13)), index=8)
-end_day = st.sidebar.number_input(
-    "Search end day", min_value=1, max_value=31, value=30, step=1
-)
-
-# Cached point-extraction helpers
-@st.cache_data(show_spinner=True)
-def extract_series_point_one_year(
-    dataset_key: str, sel_year: int, lat0_: float, lon0_: float
-) -> pd.DataFrame:
-    ds_i = DS_BY_KEY[dataset_key]
-    lat_i, lon_i, time_i = COORDS_BY_KEY[dataset_key]
-
-    da = ds_i[RAIN_VAR].sel({time_i: slice(f"{sel_year}-01-01", f"{sel_year}-12-31")})
-    da = da.sel({lat_i: lat0_, lon_i: lon0_}, method="nearest").compute()
-
-    p_lat = float(da[lat_i].values)
-    p_lon = float(da[lon_i].values)
-    label = f"{dataset_key} @ ({p_lat:.3f}, {p_lon:.3f})"
-
-    df_ = da.to_dataframe(name="rain").reset_index()
-    df_[time_i] = pd.to_datetime(df_[time_i])
-    df_ = df_.sort_values(time_i).reset_index(drop=True)
-
-    df_ = df_.rename(columns={time_i: "time"})
-    df_["dataset"] = dataset_key
-    df_["label"] = label
-    df_["lat"] = p_lat
-    df_["lon"] = p_lon
-    return df_
-
-
-@st.cache_data(show_spinner=True)
-def extract_point_daily_climatology(
-    dataset_key: str, y0_: int, y1_: int, lat0_: float, lon0_: float
-) -> pd.DataFrame:
-    ds_i = DS_BY_KEY[dataset_key]
-    lat_i, lon_i, time_i = COORDS_BY_KEY[dataset_key]
-
-    da = ds_i[RAIN_VAR].sel({time_i: slice(f"{y0_}-01-01", f"{y1_}-12-31")})
-    da = da.sel({lat_i: lat0_, lon_i: lon0_}, method="nearest").compute()
-
-    p_lat = float(da[lat_i].values)
-    p_lon = float(da[lon_i].values)
-    label = f"{dataset_key} @ ({p_lat:.3f}, {p_lon:.3f})"
-
-    doy = da[time_i].dt.dayofyear
-    clim = da.groupby(doy).mean(dim=time_i, skipna=True)
-
-    doy_vals = clim[doy.name].values.astype(int)
-    rain_vals = clim.values
-
-    keep = doy_vals <= 365
-    doy_vals = doy_vals[keep]
-    rain_vals = rain_vals[keep]
-
-    dates = pd.to_datetime("2001-01-01") + pd.to_timedelta(doy_vals - 1, unit="D")
-
-    return pd.DataFrame(
-        {
-            "time": dates,
-            "rain": rain_vals,
-            "dataset": dataset_key,
-            "label": label,
-            "lat": p_lat,
-            "lon": p_lon,
-        }
-    )
-
-# Map view helpers
-def _ethiopia_clip_and_mask(
-    da: xr.DataArray,
-    lat_name: str,
-    lon_name: str,
-    eth_geom,
-    eth_bounds: Tuple[float, float, float, float],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    eth_lon_min, eth_lat_min, eth_lon_max, eth_lat_max = eth_bounds
-
-    da = da.sel(
-        {
-            lat_name: slice(eth_lat_min, eth_lat_max),
-            lon_name: slice(eth_lon_min, eth_lon_max),
-        }
-    )
-
-    lat_vals = da[lat_name].values
-    lon_vals = da[lon_name].values
-
-    mask = make_inside_mask(lat_vals, lon_vals, eth_geom)
-    Z = np.where(mask, da.values, np.nan)
-    return lat_vals, lon_vals, Z
-
-
-def compute_map_Z_for_dataset(
-    dataset_key: str,
-    map_kind: str,
-    year_mode: str,
-    y0: int,
-    y1: int,
-    agg_mode: AggMode,
-    date_sel: Optional[pd.Timestamp],
-    eth_geom,
-    eth_bounds: Tuple[float, float, float, float],
-    use_default_mask_flag: bool,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str, str, str]:
-    """
-    Returns:
-      lat_vals, lon_vals, Z, title, cb_label, kind_tag
-    kind_tag in {"rain", "doy"}
-    """
-    ds_i = DS_BY_KEY[dataset_key]
-    files_i = FILES_BY_KEY[dataset_key]
-    lat_i, lon_i, time_i = COORDS_BY_KEY[dataset_key]
-
-    mask_da = None
-    if use_default_mask_flag:
-        mask_da = load_default_mask_da()
-
-    if map_kind == "Seasonal mean rainfall (JJAS)":
-        da_season = ds_i[RAIN_VAR].sel({time_i: slice(f"{y0}-01-01", f"{y1}-12-31")})
-        da_season = da_season.where(
-            da_season[time_i].dt.month.isin([6, 7, 8, 9]), drop=True
+# ── Grid domain (only needed when grids are selected) ──
+if selected_grids:
+    lat_ranges, lon_ranges, tmin_list, tmax_list = [], [], [], []
+    for key in selected_grids:
+        la, lo, ti = COORDS_BY_KEY[key]
+        ds_i = DS_BY_KEY[key]
+        lat_ranges.append(
+            (float(ds_i[la].min().compute()), float(ds_i[la].max().compute()))
         )
-        da_map = da_season.mean(dim=time_i).compute()
-
-        lat_vals, lon_vals, Z = _ethiopia_clip_and_mask(
-            da_map, lat_i, lon_i, eth_geom, eth_bounds
+        lon_ranges.append(
+            (float(ds_i[lo].min().compute()), float(ds_i[lo].max().compute()))
         )
+        tm0, tm1 = dataset_time_range(ds_i, ti)
+        tmin_list.append(tm0)
+        tmax_list.append(tm1)
+    lat_min = max(r[0] for r in lat_ranges)
+    lat_max = min(r[1] for r in lat_ranges)
+    lon_min = max(r[0] for r in lon_ranges)
+    lon_max = min(r[1] for r in lon_ranges)
+    tmin_common = max(tmin_list)
+    tmax_common = min(tmax_list)
 
-        if use_default_mask_flag and mask_da is not None:
-            Z = apply_nc_mask_to_Z(Z, lat_vals, lon_vals, mask_da)
 
-        title = (
-            f"{dataset_key} — Seasonal (JJAS) mean rainfall — {y0}"
-            if y0 == y1
-            else f"{dataset_key} — Seasonal (JJAS) mean rainfall — {y0}–{y1}"
+# ════════════════════════════════════════════
+# CASE A — Grids only (CHIRPS and/or ENACTS)
+# ════════════════════════════════════════════
+if selected_grids and not has_station:
+
+    # ── ② Select View(s) ──
+    st.subheader("② Select View(s)")
+    show_ts = st.checkbox("Timeseries", value=True, key="show_ts_a")
+    show_map = st.checkbox("Map (Ethiopia)", value=True, key="show_map_a")
+    if not show_ts and not show_map:
+        st.warning("Select at least one view.")
+        st.stop()
+
+    # Link toggle — only shown when both views are active
+    if show_ts and show_map:
+        link_periods = st.checkbox(
+            "🔗 Link Timeseries and Map Time Period",
+            value=True,
+            key="link_periods_a",
         )
-        return lat_vals, lon_vals, Z, title, "Rainfall (mm/day)", "rain"
-
-    if map_kind == "Daily rainfall map (selected date)":
-        if date_sel is None:
-            raise ValueError("date_sel is required for daily rainfall map")
-
-        da_day = ds_i[RAIN_VAR].sel({time_i: date_sel}, method="nearest").compute()
-        lat_vals, lon_vals, Z = _ethiopia_clip_and_mask(
-            da_day, lat_i, lon_i, eth_geom, eth_bounds
-        )
-
-        if use_default_mask_flag and mask_da is not None:
-            Z = apply_nc_mask_to_Z(Z, lat_vals, lon_vals, mask_da)
-
-        shown_date = pd.to_datetime(da_day[time_i].values).date()
-        title = f"{dataset_key} — Daily rainfall — {shown_date}"
-        return lat_vals, lon_vals, Z, title, "Rainfall (mm/day)", "rain"
-
-    # ---- DOY maps ----
-    if year_mode == "Single year":
-        lat_vals, lon_vals, wet_doy, onset_doy = compute_single_year_doy_maps(
-            ds_path_list=files_i,
-            var=RAIN_VAR,
-            lat_name=lat_i,
-            lon_name=lon_i,
-            time_name=time_i,
-            year=int(y0),
-            wet_day_mm=float(wet_day_mm),
-            accum_days=int(accum_days),
-            accum_mm=float(accum_mm),
-            dry_spell_days=int(dry_spell_days),
-            lookahead_days=int(lookahead_days),
-            start_month=int(start_month),
-            start_day=int(start_day),
-            end_month=int(end_month),
-            end_day=int(end_day),
-        )
-        Z0 = wet_doy if map_kind == "Wet spell date (DOY)" else onset_doy
-        title = (
-            f"{dataset_key} — Wet spell date (DOY) — {y0}"
-            if map_kind == "Wet spell date (DOY)"
-            else f"{dataset_key} — Onset date (DOY) — {y0}"
-        )
-        cb_label = (
-            "Wet Spell DOY" if map_kind == "Wet spell date (DOY)" else "Onset DOY"
+        st.caption(
+            "When linked, one shared time period applies to both views. "
+            "Unlink to set independent time periods for the timeseries and map."
         )
     else:
-        lat_vals, lon_vals, agg_wet_doy, agg_onset_doy = compute_agg_doy_maps(
-            ds_path_list=files_i,
-            var=RAIN_VAR,
-            lat_name=lat_i,
-            lon_name=lon_i,
-            time_name=time_i,
-            y0=int(y0),
-            y1=int(y1),
-            agg_mode=agg_mode,
-            wet_day_mm=float(wet_day_mm),
-            accum_days=int(accum_days),
-            accum_mm=float(accum_mm),
-            dry_spell_days=int(dry_spell_days),
-            lookahead_days=int(lookahead_days),
-            start_month=int(start_month),
-            start_day=int(start_day),
-            end_month=int(end_month),
-            end_day=int(end_day),
+        link_periods = True
+
+    # helper: renders year / year-range widgets, returns (y0, y1, agg_mode, year_mode_str)
+    def _year_selector(label_yr, key_prefix):
+        yr_mode = st.radio(
+            label_yr,
+            ["Single year", "Year range"],
+            horizontal=True,
+            key=f"{key_prefix}_yrmode",
         )
-        Z0 = agg_wet_doy if map_kind == "Wet spell date (DOY)" else agg_onset_doy
-        title = (
-            f"{dataset_key} — {agg_mode} wet spell date (DOY) — {y0}–{y1}"
-            if map_kind == "Wet spell date (DOY)"
-            else f"{dataset_key} — {agg_mode} onset date (DOY) — {y0}–{y1}"
+        if yr_mode == "Single year":
+            y = int(
+                st.selectbox(
+                    "Year",
+                    year_list,
+                    index=year_list.index(year_default),
+                    key=f"{key_prefix}_yr",
+                )
+            )
+            return y, y, "Mean", "Single year"
+        else:
+            cA, cB = st.columns(2)
+            with cA:
+                y0 = int(
+                    st.selectbox(
+                        "Start year", year_list, index=0, key=f"{key_prefix}_y0"
+                    )
+                )
+            with cB:
+                y1 = int(
+                    st.selectbox(
+                        "End year",
+                        year_list,
+                        index=len(year_list) - 1,
+                        key=f"{key_prefix}_y1",
+                    )
+                )
+            if y1 < y0:
+                st.error("End year must be ≥ start year.")
+                st.stop()
+            agg = st.radio(
+                "Aggregation (climatology / DOY maps)",
+                ["Mean", "Median"],
+                horizontal=True,
+                key=f"{key_prefix}_agg",
+            )
+            return y0, y1, agg, "Year range"
+
+    # ── Time period selection ──
+    st.subheader("③ Time period")
+
+    if link_periods or not (show_ts and show_map):
+        # Single shared selector
+        ts_y0, ts_y1, agg_mode_ts, ts_year_mode = _year_selector(
+            "Year selection", "a_shared"
         )
-        cb_label = (
-            f"{agg_mode} Wet Spell DOY"
-            if map_kind == "Wet spell date (DOY)"
-            else f"{agg_mode} Onset DOY"
+        map_y0, map_y1, agg_mode_map, map_year_mode = (
+            ts_y0,
+            ts_y1,
+            agg_mode_ts,
+            ts_year_mode,
         )
+    else:
+        # Separate selectors
+        if show_ts:
+            st.markdown("**Timeseries time period**")
+            ts_y0, ts_y1, agg_mode_ts, ts_year_mode = _year_selector(
+                "Timeseries year selection", "a_ts"
+            )
+        if show_map:
+            st.markdown("**Map time period**")
+            map_y0, map_y1, agg_mode_map, map_year_mode = _year_selector(
+                "Map year selection", "a_map"
+            )
 
-    # Ethiopia polygon mask
-    mask = make_inside_mask(lat_vals, lon_vals, eth_geom)
-    Z = np.where(mask, Z0, np.nan)
+    # ── Point selection — only needed for timeseries ──
+    if show_ts:
+        st.subheader("④ Point selection")
+        c1, c2 = st.columns(2)
+        with c1:
+            lat0 = st.number_input(
+                "Latitude",
+                min_value=float(lat_min),
+                max_value=float(lat_max),
+                value=float(np.clip(10.0, lat_min, lat_max)),
+                format="%.4f",
+                step=0.25,
+            )
+        with c2:
+            lon0 = st.number_input(
+                "Longitude",
+                min_value=float(lon_min),
+                max_value=float(lon_max),
+                value=float(np.clip(40.0, lon_min, lon_max)),
+                format="%.4f",
+                step=0.05,
+            )
+        for key in selected_grids:
+            la, lo, _ = COORDS_BY_KEY[key]
+            ds_i = DS_BY_KEY[key]
+            sl = float(ds_i[la].sel({la: lat0}, method="nearest").values)
+            slo = float(ds_i[lo].sel({lo: lon0}, method="nearest").values)
+            st.caption(f"{key} snapped to nearest grid cell: ({sl:.4f}°N, {slo:.4f}°E)")
+    else:
+        # map-only: set dummy point values (not used)
+        lat0 = float(np.clip(10.0, lat_min, lat_max))
+        lon0 = float(np.clip(40.0, lon_min, lon_max))
 
-    if use_default_mask_flag and mask_da is not None:
-        Z = apply_nc_mask_to_Z(Z, lat_vals, lon_vals, mask_da)
+    # ── Map options — only when map is active ──
+    if show_map:
+        st.subheader("⑤ Map options")
+        use_default_mask = st.checkbox(
+            "Apply Ethiopia .nc mask", value=True, key="mask_a"
+        )
+        map_kind = st.radio(
+            "Map type",
+            [
+                "Seasonal mean rainfall (JJAS)",
+                "Daily rainfall map (selected date)",
+                "Wet spell date (DOY)",
+                "Onset date (DOY)",
+            ],
+            horizontal=True,
+            key="a_map_kind",
+        )
+        date_sel = None
+        if map_kind == "Daily rainfall map (selected date)":
+            dflt = min(
+                max(pd.Timestamp(year=map_y0, month=7, day=15), tmin_common),
+                tmax_common,
+            )
+            date_in = st.date_input(
+                "Select date",
+                value=dflt.date(),
+                min_value=tmin_common.date(),
+                max_value=tmax_common.date(),
+            )
+            date_sel = pd.Timestamp(date_in)
 
-    return lat_vals, lon_vals, Z, title, cb_label, "doy"
+    # ── TIMESERIES PANEL ──
+    if show_ts:
+        st.subheader("Timeseries")
+        title_ts = (
+            f"Daily rainfall — ({lat0:.3f}°N, {lon0:.3f}°E) — {ts_y0}"
+            if ts_year_mode == "Single year"
+            else f"{agg_mode_ts} climatology — ({lat0:.3f}°N, {lon0:.3f}°E) — {ts_y0}–{ts_y1}"
+        )
+        fig_ts = build_plotly_ts(title_ts)
+        for key in selected_grids:
+            la, lo, ti = COORDS_BY_KEY[key]
+            fi = FILES_BY_KEY[key]
+            clr = DATASET_COLORS.get(key, {}).get("rain", "black")
+            if ts_year_mode == "Single year":
+                df_ts = extract_series_single_year(
+                    key, tuple(fi), la, lo, ti, ts_y0, lat0, lon0
+                )
+                add_rain_trace(
+                    fig_ts,
+                    df_ts["time"],
+                    df_ts["rain"],
+                    label=f"{key} daily rainfall",
+                    color=clr,
+                )
+                add_wetspell_onset_traces(fig_ts, df_ts, key, key)
+                add_wet_threshold_trace(fig_ts, float(wet_day_mm), df_ts["time"])
+            else:
+                df_c = extract_climatology(
+                    key, tuple(fi), la, lo, ti, ts_y0, ts_y1, lat0, lon0, agg_mode_ts
+                )
+                add_rain_trace(
+                    fig_ts,
+                    df_c["time"],
+                    df_c["rain"],
+                    label=f"{key} {agg_mode_ts} ({ts_y0}–{ts_y1})",
+                    color=clr,
+                    show_markers=True,
+                )
+                add_wetspell_onset_traces(fig_ts, df_c, key, key)
+                add_wet_threshold_trace(fig_ts, float(wet_day_mm), df_c["time"])
+        st.plotly_chart(fig_ts, use_container_width=True)
 
+    # ── MAP PANEL ──
+    if show_map:
+        st.subheader("Map view")
+        eth = load_ethiopia_boundary()
+        eth_geom = eth.geometry.iloc[0]
+        eth_bounds = tuple(map(float, eth.total_bounds))
+        mask_da = load_default_mask_da() if use_default_mask else None
+        cmap_jjas, norm_jjas, tpos, tlbl = build_jjas_doy_cmap()
+        yr_label = str(map_y0) if map_y0 == map_y1 else f"{map_y0}–{map_y1}"
 
-def _nanminmax(a: np.ndarray) -> Tuple[float, float]:
-    vmin = float(np.nanmin(a)) if np.isfinite(np.nanmin(a)) else 0.0
-    vmax = float(np.nanmax(a)) if np.isfinite(np.nanmax(a)) else 1.0
-    if vmin == vmax:
-        vmax = vmin + 1e-6
-    return vmin, vmax
+        def get_map_Z(key):
+            la, lo, ti = COORDS_BY_KEY[key]
+            fi = FILES_BY_KEY[key]
+            ds_i = DS_BY_KEY[key]
+            if map_kind == "Seasonal mean rainfall (JJAS)":
+                da = ds_i[RAIN_VAR].sel(
+                    {ti: slice(f"{map_y0}-01-01", f"{map_y1}-12-31")}
+                )
+                da = (
+                    da.where(da[ti].dt.month.isin([6, 7, 8, 9]), drop=True)
+                    .mean(dim=ti)
+                    .compute()
+                )
+                return (
+                    clip_and_mask_map(
+                        da.values,
+                        da[la].values,
+                        da[lo].values,
+                        eth_geom,
+                        eth_bounds,
+                        mask_da,
+                    ),
+                    "rain",
+                )
+            elif map_kind == "Daily rainfall map (selected date)":
+                da = ds_i[RAIN_VAR].sel({ti: date_sel}, method="nearest").compute()
+                return (
+                    clip_and_mask_map(
+                        da.values,
+                        da[la].values,
+                        da[lo].values,
+                        eth_geom,
+                        eth_bounds,
+                        mask_da,
+                    ),
+                    "rain",
+                )
+            else:
+                if map_year_mode == "Single year":
+                    lv, lov, wd, od = compute_single_year_doy_maps(
+                        tuple(fi),
+                        RAIN_VAR,
+                        la,
+                        lo,
+                        ti,
+                        map_y0,
+                        float(wet_day_mm),
+                        int(accum_days),
+                        float(accum_mm),
+                        int(dry_spell_days),
+                        int(lookahead_days),
+                        int(start_month),
+                        int(start_day),
+                        int(end_month),
+                        int(end_day),
+                    )
+                else:
+                    lv, lov, wd, od = compute_agg_doy_maps(
+                        tuple(fi),
+                        RAIN_VAR,
+                        la,
+                        lo,
+                        ti,
+                        map_y0,
+                        map_y1,
+                        agg_mode_map,
+                        float(wet_day_mm),
+                        int(accum_days),
+                        float(accum_mm),
+                        int(dry_spell_days),
+                        int(lookahead_days),
+                        int(start_month),
+                        int(start_day),
+                        int(end_month),
+                        int(end_day),
+                    )
+                Z0 = wd if map_kind == "Wet spell date (DOY)" else od
+                return (
+                    clip_and_mask_map(Z0, lv, lov, eth_geom, eth_bounds, mask_da),
+                    "doy",
+                )
 
-# Map view
-if mode == "Map (Ethiopia)":
-    st.subheader("Map view options")
+        if len(selected_grids) == 1:
+            key = selected_grids[0]
+            (lv, lov, Z), kind = get_map_Z(key)
+            fig_m, ax = plt.subplots(figsize=(10, 6))
+            Lon, Lat = np.meshgrid(lov, lv)
+            if kind == "rain":
+                plot_rain_map(
+                    ax,
+                    Lon,
+                    Lat,
+                    Z,
+                    eth,
+                    f"{key} — {map_kind} — {yr_label}",
+                    "Rainfall (mm/day)",
+                    fig_m,
+                )
+            else:
+                cb_lbl = (
+                    "Wet Spell DOY"
+                    if map_kind == "Wet spell date (DOY)"
+                    else "Onset DOY"
+                )
+                plot_doy_map(
+                    ax,
+                    Lon,
+                    Lat,
+                    Z,
+                    eth,
+                    f"{key} — {map_kind} — {yr_label}",
+                    cb_lbl,
+                    cmap_jjas,
+                    norm_jjas,
+                    tpos,
+                    tlbl,
+                    fig_m,
+                )
+            st.pyplot(fig_m)
 
-    year_mode = st.radio(
+        else:  # both CHIRPS + ENACTS
+            (lv1, lov1, Z1), kind1 = get_map_Z("CHIRPS")
+            (lv2, lov2, Z2), kind2 = get_map_Z("ENACTS")
+            same_shape = Z1.shape == Z2.shape
+            if not same_shape:
+                st.warning(
+                    f"Grid shapes differ after clipping "
+                    f"(CHIRPS {Z1.shape} vs ENACTS {Z2.shape}). "
+                    "Difference map unavailable — showing individual maps only."
+                )
+
+            cols = st.columns(3) if same_shape else st.columns(2)
+            vmin12 = vmax12 = None
+            if kind1 == "rain" and same_shape:
+                vmin12, vmax12 = _nanminmax(np.concatenate([Z1.ravel(), Z2.ravel()]))
+
+            with cols[0]:
+                st.markdown("### CHIRPS")
+                fig_m, ax = plt.subplots(figsize=(5, 4))
+                Lon, Lat = np.meshgrid(lov1, lv1)
+                if kind1 == "rain":
+                    plot_rain_map(
+                        ax,
+                        Lon,
+                        Lat,
+                        Z1,
+                        eth,
+                        f"CHIRPS — {yr_label}",
+                        "mm/day",
+                        fig_m,
+                        vmin12,
+                        vmax12,
+                    )
+                else:
+                    plot_doy_map(
+                        ax,
+                        Lon,
+                        Lat,
+                        Z1,
+                        eth,
+                        f"CHIRPS — {yr_label}",
+                        "DOY",
+                        cmap_jjas,
+                        norm_jjas,
+                        tpos,
+                        tlbl,
+                        fig_m,
+                    )
+                st.pyplot(fig_m)
+
+            with cols[1]:
+                st.markdown("### ENACTS")
+                fig_m, ax = plt.subplots(figsize=(5, 4))
+                Lon, Lat = np.meshgrid(lov2, lv2)
+                if kind2 == "rain":
+                    plot_rain_map(
+                        ax,
+                        Lon,
+                        Lat,
+                        Z2,
+                        eth,
+                        f"ENACTS — {yr_label}",
+                        "mm/day",
+                        fig_m,
+                        vmin12,
+                        vmax12,
+                    )
+                else:
+                    plot_doy_map(
+                        ax,
+                        Lon,
+                        Lat,
+                        Z2,
+                        eth,
+                        f"ENACTS — {yr_label}",
+                        "DOY",
+                        cmap_jjas,
+                        norm_jjas,
+                        tpos,
+                        tlbl,
+                        fig_m,
+                    )
+                st.pyplot(fig_m)
+
+            if same_shape:
+                with cols[2]:
+                    st.markdown("### CHIRPS − ENACTS")
+                    Zdiff = Z1 - Z2
+                    fig_m, ax = plt.subplots(figsize=(5, 4))
+                    Lon, Lat = np.meshgrid(lov1, lv1)
+                    if kind1 == "rain":
+                        ma = float(np.nanmax(np.abs(Zdiff))) or 1e-6
+                        pcm = ax.pcolormesh(
+                            Lon,
+                            Lat,
+                            Zdiff,
+                            shading="auto",
+                            cmap="RdBu_r",
+                            norm=TwoSlopeNorm(vcenter=0.0, vmin=-ma, vmax=ma),
+                        )
+                        eth.boundary.plot(
+                            ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10
+                        )
+                        ax.set_title(f"Difference — {yr_label}", fontsize=9)
+                        cb = fig_m.colorbar(pcm, ax=ax)
+                        cb.set_label("mm/day (CHIRPS−ENACTS)", fontsize=8)
+                    else:
+                        lvls = np.arange(-30, 31, 5)
+                        pcm = ax.pcolormesh(
+                            Lon,
+                            Lat,
+                            np.clip(Zdiff, -30, 30),
+                            shading="auto",
+                            cmap=plt.cm.get_cmap("RdBu_r", len(lvls) - 1),
+                            norm=BoundaryNorm(lvls, len(lvls) - 1),
+                        )
+                        eth.boundary.plot(
+                            ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10
+                        )
+                        ax.set_title(f"DOY Difference — {yr_label}", fontsize=9)
+                        cb = fig_m.colorbar(pcm, ax=ax, ticks=lvls)
+                        cb.set_label("DOY (CHIRPS−ENACTS)", fontsize=8)
+                    ax.set_xlabel("Lon")
+                    ax.set_ylabel("Lat")
+                    st.pyplot(fig_m)
+
+# ════════════════════════════════════════════
+# CASE B — EMI Stations only
+# ════════════════════════════════════════════
+elif has_station and not selected_grids:
+
+    st.info("Map view is not available for EMI Stations. Showing timeseries only.")
+    st.subheader("② Station & time selection")
+
+    station_name = st.selectbox("Select EMI station", options=list(emi_meta.index))
+    st_lat = float(emi_meta.loc[station_name, "lat"])
+    st_lon = float(emi_meta.loc[station_name, "lon"])
+    st.caption(f"Station coordinates: ({st_lat:.4f}°N, {st_lon:.4f}°E)")
+
+    ts_year_mode = st.radio(
         "Year selection",
         ["Single year", "Year range"],
         horizontal=True,
-        key="year_mode",
+        key="b_ts_mode",
     )
-
-    if year_mode == "Year range":
-        agg_mode: AggMode = st.radio(
-            "Across-years aggregation (DOY maps)",
-            ["Median", "Mean"],
-            horizontal=True,
-            key="agg_mode",
-        )
-    else:
-        agg_mode = "Median"
-
-    map_kind = st.radio(
-        "Map type",
-        [
-            "Seasonal mean rainfall (JJAS)",
-            "Daily rainfall map (selected date)",
-            "Wet spell date (DOY)",
-            "Onset date (DOY)",
-        ],
-        horizontal=True,
-        key="map_kind",
-    )
-
-    if year_mode == "Single year":
-        y0 = y1 = int(
+    if ts_year_mode == "Single year":
+        ts_year = int(
             st.selectbox(
-                "Year",
-                options=year_list,
-                index=year_list.index(int(year)),
-                key="map_year_single",
+                "Year", year_list, index=year_list.index(year_default), key="b_yr"
             )
         )
+        ts_y0 = ts_y1 = ts_year
     else:
-        cA, cB = st.columns([1, 1])
+        cA, cB = st.columns(2)
         with cA:
-            y0 = int(
-                st.selectbox(
-                    "Start year", options=year_list, index=0, key="map_year_start"
-                )
-            )
+            ts_y0 = int(st.selectbox("Start year", year_list, index=0, key="b_y0"))
         with cB:
-            y1 = int(
+            ts_y1 = int(
                 st.selectbox(
-                    "End year",
-                    options=year_list,
-                    index=len(year_list) - 1,
-                    key="map_year_end",
+                    "End year", year_list, index=len(year_list) - 1, key="b_y1"
                 )
             )
-        if y1 < y0:
+        if ts_y1 < ts_y0:
             st.error("End year must be ≥ start year.")
             st.stop()
 
-    eth = load_ethiopia_boundary()
-    eth_geom = eth.geometry.iloc[0]
-    eth_bounds = tuple(map(float, eth.total_bounds))  # (xmin, ymin, xmax, ymax)
+    s = emi_ts[station_name].loc[f"{ts_y0}-01-01":f"{ts_y1}-12-31"]
+    df_st = s.rename("rain").to_frame().reset_index()
+    df_st.columns = ["time", "rain"]
 
-    date_sel = None
-    if map_kind == "Daily rainfall map (selected date)":
-        tmin_ui, tmax_ui = tmin_common, tmax_common
-        default_date = pd.Timestamp(year=int(year), month=7, day=15)
-        default_date = min(max(default_date, tmin_ui), tmax_ui)
-
-        date_in = st.date_input(
-            "Select date for daily rainfall map",
-            value=default_date.to_pydatetime().date(),
-            min_value=tmin_ui.date(),
-            max_value=tmax_ui.date(),
+    if ts_year_mode == "Single year":
+        fig_ts = build_plotly_ts(
+            f"Station: {station_name} ({st_lat:.3f}°N, {st_lon:.3f}°E) — {ts_y0}"
         )
-        date_sel = pd.Timestamp(date_in)
-
-    if len(selected_datasets) == 1:
-        key = selected_datasets[0]
-        lat_vals, lon_vals, Z, title, cb_label, kind_tag = compute_map_Z_for_dataset(
-            dataset_key=key,
-            map_kind=map_kind,
-            year_mode=year_mode,
-            y0=int(y0),
-            y1=int(y1),
-            agg_mode=agg_mode,
-            date_sel=date_sel,
-            eth_geom=eth_geom,
-            eth_bounds=eth_bounds,
-            use_default_mask_flag=use_default_mask,
+        add_rain_trace(
+            fig_ts,
+            df_st["time"],
+            df_st["rain"],
+            label=f"{station_name} daily rainfall",
+            color=DATASET_COLORS[STATION_KEY]["rain"],
+            show_markers=True,
         )
+        add_wetspell_onset_traces(fig_ts, df_st, STATION_KEY, station_name)
+        add_wet_threshold_trace(fig_ts, float(wet_day_mm), df_st["time"])
+    else:
+        df_st["doy"] = df_st["time"].dt.dayofyear
+        clim = df_st.groupby("doy")["rain"].mean().reset_index()
+        clim = clim[clim["doy"] <= 365].copy()
+        clim["time"] = pd.to_datetime("2001-01-01") + pd.to_timedelta(
+            clim["doy"] - 1, unit="D"
+        )
+        fig_ts = build_plotly_ts(
+            f"Station climatology: {station_name} — {ts_y0}–{ts_y1}"
+        )
+        add_rain_trace(
+            fig_ts,
+            clim["time"],
+            clim["rain"],
+            label=f"{station_name} mean climatology ({ts_y0}–{ts_y1})",
+            color=DATASET_COLORS[STATION_KEY]["rain"],
+            show_markers=True,
+        )
+        add_wetspell_onset_traces(fig_ts, clim, STATION_KEY, station_name)
+        add_wet_threshold_trace(fig_ts, float(wet_day_mm), clim["time"])
 
-        fig, ax = plt.subplots(figsize=(12, 6))
-        Lon, Lat = np.meshgrid(lon_vals, lat_vals)
+    st.plotly_chart(fig_ts, use_container_width=True)
 
-        if kind_tag == "rain":
-            vmin, vmax = _nanminmax(Z)
-            pcm = ax.pcolormesh(
-                Lon, Lat, Z, shading="auto", cmap="Blues", vmin=vmin, vmax=vmax
-            )
-        else:
-            cmap_jjas, norm_jjas, tick_positions, tick_labels = build_jjas_doy_cmap()
-            pcm = ax.pcolormesh(
-                Lon, Lat, Z, shading="auto", cmap=cmap_jjas, norm=norm_jjas
-            )
 
-        eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-        ax.set_title(title)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
+# ════════════════════════════════════════════
+# CASE C — EMI Stations + grids
+# ════════════════════════════════════════════
+elif has_station and selected_grids:
 
-        cb = fig.colorbar(pcm, ax=ax)
-        cb.set_label(cb_label)
-        if kind_tag == "doy":
-            cb.set_ticks(tick_positions)
-            cb.set_ticklabels(tick_labels)
-
-        st.pyplot(fig)
-        st.stop()
-
-    # Two datasets: CHIRPS, ENACTS, DIFF
-    left_key, right_key = "CHIRPS", "ENACTS"
-    if left_key not in selected_datasets or right_key not in selected_datasets:
-        left_key, right_key = selected_datasets[0], selected_datasets[1]
-
-    lat1, lon1, Z1, title1, cb1, kind1 = compute_map_Z_for_dataset(
-        dataset_key=left_key,
-        map_kind=map_kind,
-        year_mode=year_mode,
-        y0=int(y0),
-        y1=int(y1),
-        agg_mode=agg_mode,
-        date_sel=date_sel,
-        eth_geom=eth_geom,
-        eth_bounds=eth_bounds,
-        use_default_mask_flag=use_default_mask,
+    st.info(
+        "Map view is not available when EMI Stations are selected. Showing timeseries only."
     )
-    lat2, lon2, Z2, title2, cb2, kind2 = compute_map_Z_for_dataset(
-        dataset_key=right_key,
-        map_kind=map_kind,
-        year_mode=year_mode,
-        y0=int(y0),
-        y1=int(y1),
-        agg_mode=agg_mode,
-        date_sel=date_sel,
-        eth_geom=eth_geom,
-        eth_bounds=eth_bounds,
-        use_default_mask_flag=use_default_mask,
+    st.subheader("② Station & time selection")
+
+    station_name = st.selectbox("Select EMI station", options=list(emi_meta.index))
+    st_lat = float(emi_meta.loc[station_name, "lat"])
+    st_lon = float(emi_meta.loc[station_name, "lon"])
+    st.caption(f"Station coordinates: ({st_lat:.4f}°N, {st_lon:.4f}°E)")
+
+    for key in selected_grids:
+        la, lo, _ = COORDS_BY_KEY[key]
+        ds_i = DS_BY_KEY[key]
+        sl = float(ds_i[la].sel({la: st_lat}, method="nearest").values)
+        slo = float(ds_i[lo].sel({lo: st_lon}, method="nearest").values)
+        st.caption(f"{key} nearest grid cell: ({sl:.4f}°N, {slo:.4f}°E)")
+
+    ts_year_mode = st.radio(
+        "Year selection",
+        ["Single year", "Year range"],
+        horizontal=True,
+        key="c_ts_mode",
     )
-
-    if Z1.shape != Z2.shape:
-        st.error(
-            "CHIRPS and ENACTS map grids do not match after clipping. Need regridding to compute difference."
+    if ts_year_mode == "Single year":
+        ts_year = int(
+            st.selectbox(
+                "Year", year_list, index=year_list.index(year_default), key="c_yr"
+            )
         )
-        st.stop()
-
-    Zdiff = Z1 - Z2
-
-    if kind1 != kind2:
-        st.error("Internal error: map kind mismatch between datasets.")
-        st.stop()
-
-    if kind1 == "rain":
-        vmin_12 = float(np.nanmin([np.nanmin(Z1), np.nanmin(Z2)]))
-        vmax_12 = float(np.nanmax([np.nanmax(Z1), np.nanmax(Z2)]))
-        if not np.isfinite(vmin_12) or not np.isfinite(vmax_12) or vmin_12 == vmax_12:
-            vmin_12, vmax_12 = 0.0, 1.0
-
-        max_abs = float(np.nanmax(np.abs(Zdiff)))
-        if not np.isfinite(max_abs) or max_abs == 0:
-            max_abs = 1e-6
-        diff_norm = TwoSlopeNorm(vcenter=0.0, vmin=-max_abs, vmax=max_abs)
-
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            st.markdown(f"### {left_key}")
-            fig, ax = plt.subplots(figsize=(5.2, 4.2))
-            Lon, Lat = np.meshgrid(lon1, lat1)
-            pcm = ax.pcolormesh(
-                Lon, Lat, Z1, shading="auto", cmap="Blues", vmin=vmin_12, vmax=vmax_12
+        ts_y0 = ts_y1 = ts_year
+        agg_mode_ts = "Mean"
+    else:
+        cA, cB = st.columns(2)
+        with cA:
+            ts_y0 = int(st.selectbox("Start year", year_list, index=0, key="c_y0"))
+        with cB:
+            ts_y1 = int(
+                st.selectbox(
+                    "End year", year_list, index=len(year_list) - 1, key="c_y1"
+                )
             )
-            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-            ax.set_title(title1)
-            ax.set_xlabel("Lon")
-            ax.set_ylabel("Lat")
-            cb = fig.colorbar(pcm, ax=ax)
-            cb.set_label(cb1)
-            st.pyplot(fig)
+        if ts_y1 < ts_y0:
+            st.error("End year must be ≥ start year.")
+            st.stop()
+        agg_mode_ts = st.radio(
+            "Climatology aggregation", ["Mean", "Median"], horizontal=True, key="c_agg"
+        )
 
-        with c2:
-            st.markdown(f"### {right_key}")
-            fig, ax = plt.subplots(figsize=(5.2, 4.2))
-            Lon, Lat = np.meshgrid(lon2, lat2)
-            pcm = ax.pcolormesh(
-                Lon, Lat, Z2, shading="auto", cmap="Blues", vmin=vmin_12, vmax=vmax_12
-            )
-            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-            ax.set_title(title2)
-            ax.set_xlabel("Lon")
-            ax.set_ylabel("Lat")
-            cb = fig.colorbar(pcm, ax=ax)
-            cb.set_label(cb2)
-            st.pyplot(fig)
+    s = emi_ts[station_name].loc[f"{ts_y0}-01-01":f"{ts_y1}-12-31"]
+    df_st = s.rename("rain").to_frame().reset_index()
+    df_st.columns = ["time", "rain"]
 
-        with c3:
-            st.markdown(f"### {left_key} − {right_key}")
-            fig, ax = plt.subplots(figsize=(5.2, 4.2))
-            Lon, Lat = np.meshgrid(lon1, lat1)
-            pcm = ax.pcolormesh(
-                Lon, Lat, Zdiff, shading="auto", cmap="RdBu_r", norm=diff_norm
+    if ts_year_mode == "Single year":
+        fig_ts = build_plotly_ts(
+            f"Station vs gridded — {station_name} ({st_lat:.3f}°N, {st_lon:.3f}°E) — {ts_y0}"
+        )
+
+        # Station series (with dots)
+        add_rain_trace(
+            fig_ts,
+            df_st["time"],
+            df_st["rain"],
+            label=f"{station_name} daily rainfall",
+            color=DATASET_COLORS[STATION_KEY]["rain"],
+            show_markers=True,
+        )
+        add_wetspell_onset_traces(fig_ts, df_st, STATION_KEY, station_name)
+
+        # Grid series
+        for key in selected_grids:
+            la, lo, ti = COORDS_BY_KEY[key]
+            fi = FILES_BY_KEY[key]
+            df_g = extract_series_single_year(
+                key, tuple(fi), la, lo, ti, ts_y0, st_lat, st_lon
             )
-            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-            ax.set_title(f"Difference — {map_kind}")
-            ax.set_xlabel("Lon")
-            ax.set_ylabel("Lat")
-            cb = fig.colorbar(pcm, ax=ax)
-            cb.set_label(f"{cb1} ({left_key} − {right_key})")
-            st.pyplot(fig)
+            sl = df_g["snapped_lat"].iloc[0]
+            slo = df_g["snapped_lon"].iloc[0]
+            add_rain_trace(
+                fig_ts,
+                df_g["time"],
+                df_g["rain"],
+                label=f"{key} daily rainfall @ ({sl:.3f}°N, {slo:.3f}°E)",
+                color=DATASET_COLORS.get(key, {}).get("rain", "black"),
+                show_markers=True,
+            )
+            add_wetspell_onset_traces(fig_ts, df_g, key, key)
+
+        add_wet_threshold_trace(fig_ts, float(wet_day_mm), df_st["time"])
 
     else:
-        cmap_jjas, norm_jjas, tick_positions, tick_labels = build_jjas_doy_cmap()
+        fig_ts = build_plotly_ts(
+            f"Climatology — {station_name} vs gridded — {ts_y0}–{ts_y1}"
+        )
 
-        c1, c2, c3 = st.columns(3)
+        # Station climatology
+        df_st["doy"] = df_st["time"].dt.dayofyear
+        clim_st = df_st.groupby("doy")["rain"].mean().reset_index()
+        clim_st = clim_st[clim_st["doy"] <= 365].copy()
+        clim_st["time"] = pd.to_datetime("2001-01-01") + pd.to_timedelta(
+            clim_st["doy"] - 1, unit="D"
+        )
+        add_rain_trace(
+            fig_ts,
+            clim_st["time"],
+            clim_st["rain"],
+            label=f"{station_name} mean ({ts_y0}–{ts_y1})",
+            color=DATASET_COLORS[STATION_KEY]["rain"],
+            show_markers=True,
+        )
+        add_wetspell_onset_traces(fig_ts, clim_st, STATION_KEY, station_name)
 
-        # --- LEFT DOY map ---
-        with c1:
-            st.markdown(f"### {left_key}")
-            fig, ax = plt.subplots(figsize=(5.2, 4.2))
-            Lon, Lat = np.meshgrid(lon1, lat1)
-            pcm = ax.pcolormesh(
-                Lon, Lat, Z1, shading="auto", cmap=cmap_jjas, norm=norm_jjas
+        # Grid climatologies
+        for key in selected_grids:
+            la, lo, ti = COORDS_BY_KEY[key]
+            fi = FILES_BY_KEY[key]
+            df_c = extract_climatology(
+                key, tuple(fi), la, lo, ti, ts_y0, ts_y1, st_lat, st_lon, agg_mode_ts
             )
-            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-            ax.set_title(title1)
-            ax.set_xlabel("Lon")
-            ax.set_ylabel("Lat")
-            cb = fig.colorbar(pcm, ax=ax)
-            cb.set_label(cb1)
-            cb.set_ticks(tick_positions)
-            cb.set_ticklabels(tick_labels)
-            st.pyplot(fig)
-
-        # --- RIGHT DOY map ---
-        with c2:
-            st.markdown(f"### {right_key}")
-            fig, ax = plt.subplots(figsize=(5.2, 4.2))
-            Lon, Lat = np.meshgrid(lon2, lat2)
-            pcm = ax.pcolormesh(
-                Lon, Lat, Z2, shading="auto", cmap=cmap_jjas, norm=norm_jjas
+            sl = df_c["snapped_lat"].iloc[0]
+            slo = df_c["snapped_lon"].iloc[0]
+            add_rain_trace(
+                fig_ts,
+                df_c["time"],
+                df_c["rain"],
+                label=f"{key} {agg_mode_ts} @ ({sl:.3f}°N, {slo:.3f}°E) ({ts_y0}–{ts_y1})",
+                color=DATASET_COLORS.get(key, {}).get("rain", "black"),
+                show_markers=True,
             )
-            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-            ax.set_title(title2)
-            ax.set_xlabel("Lon")
-            ax.set_ylabel("Lat")
-            cb = fig.colorbar(pcm, ax=ax)
-            cb.set_label(cb2)
-            cb.set_ticks(tick_positions)
-            cb.set_ticklabels(tick_labels)
-            st.pyplot(fig)
+            add_wetspell_onset_traces(fig_ts, df_c, key, key)
 
-        # --- DIFFERENCE MAP: DISCRETE -30..30 DOY ---
-        with c3:
-            st.markdown(f"### {left_key} − {right_key}")
-            fig, ax = plt.subplots(figsize=(5.2, 4.2))
-            Lon, Lat = np.meshgrid(lon1, lat1)
+        add_wet_threshold_trace(fig_ts, float(wet_day_mm), clim_st["time"])
 
-            levels = np.arange(-30, 31, 5)  # -30, -25, ..., 30
-            cmap_diff = plt.cm.get_cmap("RdBu_r", len(levels) - 1)
-            norm_diff = BoundaryNorm(levels, cmap_diff.N)
-
-            Zdiff_plot = np.clip(Zdiff, -30, 30)
-
-            pcm = ax.pcolormesh(
-                Lon, Lat, Zdiff_plot, shading="auto", cmap=cmap_diff, norm=norm_diff
-            )
-            eth.boundary.plot(ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10)
-            ax.set_title(f"Difference — {map_kind}")
-            ax.set_xlabel("Lon")
-            ax.set_ylabel("Lat")
-
-            cb = fig.colorbar(pcm, ax=ax, ticks=levels)
-            cb.set_label(f"DOY difference ({left_key} − {right_key})")
-            st.pyplot(fig)
-
-# Point time series view
-st.subheader("Point timeseries: rainfall, wet spell start, onset")
-
-show_ts = True
-if mode == "Map (Ethiopia)":
-    show_ts = st.checkbox("Show point time series", value=False, key="show_ts_map")
-
-if show_ts:
-    if mode == "Map (Ethiopia)":
-        ts_y0, ts_y1 = int(y0), int(y1)
-        ts_year_mode = year_mode
-    else:
-        ts_y0 = ts_y1 = int(year)
-        ts_year_mode = "Single year"
-
-    fig, ax = plt.subplots(figsize=(14, 6))
-    df_for_table: Dict[str, pd.DataFrame] = {}
-
-    for key in selected_datasets:
-        if ts_year_mode == "Single year":
-            df_ts = extract_series_point_one_year(key, ts_y0, float(lat0), float(lon0))
-
-            wet_cand_date, wet_cand_idx = detect_first_wet_spell(
-                dates=df_ts["time"],
-                rain=df_ts["rain"].values,
-                wet_day_mm=float(wet_day_mm),
-                accum_days=int(accum_days),
-                accum_mm=float(accum_mm),
-                start_month=int(start_month),
-                start_day=int(start_day),
-                end_month=int(end_month),
-                end_day=int(end_day),
-            )
-            wet_spell_start = wet_spell_start_from_idx(
-                dates=df_ts["time"],
-                rain=df_ts["rain"].values,
-                idx=wet_cand_idx,
-                wet_day_mm=float(wet_day_mm),
-            )
-
-            onset_date, _ = detect_onset(
-                dates=df_ts["time"],
-                rain=df_ts["rain"].values,
-                wet_day_mm=float(wet_day_mm),
-                accum_days=int(accum_days),
-                accum_mm=float(accum_mm),
-                dry_spell_days=int(dry_spell_days),
-                lookahead_days=int(lookahead_days),
-                start_month=int(start_month),
-                start_day=int(start_day),
-                end_month=int(end_month),
-                end_day=int(end_day),
-            )
-
-            if key.upper() == "CHIRPS":
-                rain_color, wet_color, onset_color = "blue", "purple", "pink"
-            elif key.upper() == "ENACTS":
-                rain_color, wet_color, onset_color = "orange", "red", "yellow"
-            else:
-                rain_color, wet_color, onset_color = "black", "gray", "green"
-
-            ax.plot(
-                df_ts["time"],
-                df_ts["rain"],
-                color=rain_color,
-                marker="o",
-                markersize=3,
-                linewidth=1.2,
-                label=f"{key} daily rainfall",
-            )
-
-            if wet_spell_start is not None:
-                ax.axvline(
-                    wet_spell_start,
-                    color=wet_color,
-                    linestyle="--",
-                    linewidth=2.0,
-                    label=f"{key} wet spell start: {wet_spell_start.date()}",
-                )
-
-            if onset_date is not None:
-                ax.axvline(
-                    onset_date,
-                    color=onset_color,
-                    linestyle="-",
-                    linewidth=2.5,
-                    label=f"{key} onset: {onset_date.date()}",
-                )
-
-            df_for_table[key] = df_ts[["time", "rain", "lat", "lon"]].rename(
-                columns={"time": "date"}
-            )
-
-        else:
-            df_ts = extract_point_daily_climatology(
-                key, ts_y0, ts_y1, float(lat0), float(lon0)
-            )
-
-            rain_color = (
-                "blue"
-                if key.upper() == "CHIRPS"
-                else ("orange" if key.upper() == "ENACTS" else "black")
-            )
-
-            ax.plot(
-                df_ts["time"],
-                df_ts["rain"],
-                color=rain_color,
-                marker="o",
-                markersize=3,
-                linewidth=1.2,
-                label=f"{key} climatology (mean by DOY)",
-            )
-
-            df_for_table[key] = df_ts[["time", "rain", "lat", "lon"]].rename(
-                columns={"time": "date"}
-            )
-
-    handles, labels = ax.get_legend_handles_labels()
-
-    def _legend_rank(lbl: str) -> int:
-        s = lbl.lower()
-        d = 0 if "chirps" in s else (1 if "enacts" in s else 9)
-        if "daily rainfall" in s or "climatology" in s:
-            k = 0
-        elif "wet spell start" in s:
-            k = 1
-        elif "onset" in s:
-            k = 2
-        elif "wet day" in s:
-            k = 3
-        else:
-            k = 8
-        return d * 10 + k
-
-    order = sorted(range(len(labels)), key=lambda i: _legend_rank(labels[i]))
-    handles = [handles[i] for i in order]
-    labels = [labels[i] for i in order]
-
-    ax.legend(handles, labels, loc="upper right")
-    ax.axhline(
-        float(wet_day_mm),
-        linestyle="--",
-        color="gray",
-        linewidth=1.5,
-        label=f"Wet day ≥ {float(wet_day_mm):g} mm/day",
-    )
-
-    title_suffix = (
-        f"{ts_y0}"
-        if ts_year_mode == "Single year"
-        else f"{ts_y0}–{ts_y1} (daily climatology)"
-    )
-    ax.set_ylabel("Rainfall (mm/day)")
-    ax.set_xlabel("Date")
-    ax.set_title(f"Rainfall time series — ({lat0:.3f}, {lon0:.3f}) — {title_suffix}")
-    ax.legend()
-    st.pyplot(fig)
-
-    with st.expander("Show extracted time series data", expanded=False):
-        if len(selected_datasets) == 1:
-            key = selected_datasets[0]
-            st.dataframe(df_for_table[key], use_container_width=True)
-        else:
-            cL, cR = st.columns([1, 1])
-            with cL:
-                st.markdown(f"#### {selected_datasets[0]}")
-                st.dataframe(
-                    df_for_table[selected_datasets[0]], use_container_width=True
-                )
-            with cR:
-                st.markdown(f"#### {selected_datasets[1]}")
-                st.dataframe(
-                    df_for_table[selected_datasets[1]], use_container_width=True
-                )
+    st.plotly_chart(fig_ts, use_container_width=True)

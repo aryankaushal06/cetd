@@ -23,10 +23,17 @@ LINEWIDTH_ETH = 2.0
 DATASET_FOLDERS: Dict[str, str] = {
     "CHIRPS": "CHIRPS",
     "ENACTS": "ENACTS",
+    "IMERG": "IMERG",
 }
+# Per-dataset rainfall variable names inside the NetCDF files
+RAIN_VAR_BY_KEY: Dict[str, str] = {
+    "CHIRPS": "precip",
+    "ENACTS": "precip",
+    "IMERG": "precip",  # update here if IMERG uses a different var name
+}
+RAIN_VAR = "precip"  # fallback default
 FILE_GLOB = "*.nc"
 CHUNKSIZE = 365
-RAIN_VAR = "precip"
 APP_DIR = Path(__file__).resolve().parent
 STATION_KEY = "EMI Stations"
 STATION_CSV_PATH = APP_DIR / "RF_Station_Grid_Format.csv"
@@ -35,6 +42,7 @@ DEFAULT_MASK_NC_PATH = APP_DIR / "chirps_jjas_seasonal_mask_ethiopia_0p25.nc"
 DATASET_COLORS = {
     "CHIRPS": {"rain": "steelblue", "wet": "#1a1aff", "onset": "#000080"},
     "ENACTS": {"rain": "darkorange", "wet": "#cc0000", "onset": "#660000"},
+    "IMERG": {"rain": "#9467bd", "wet": "#6a0dad", "onset": "#3b0066"},
     STATION_KEY: {"rain": "#2ca02c", "wet": "#7fff00", "onset": "#006400"},
 }
 
@@ -72,19 +80,55 @@ end_day = st.sidebar.number_input(
 # ─────────────────────────────────────────────
 # Data loading helpers
 # ─────────────────────────────────────────────
+
+
+def _fix_imerg_time(ds: "xr.Dataset", filepath: str) -> "xr.Dataset":
+    """IMERG files often have a corrupted time coordinate after CDO remapping
+    (the stored integer no longer matches the true date). We recover the correct
+    dates directly from the filename, which follows the pattern *_YYYY_* or
+    *YYYY*.nc  (e.g. imerg_2024_ethiopia_0p25.nc).
+    For each file we assign a daily time axis starting on Jan 1 of that year."""
+    import re as _re
+
+    fname = Path(filepath).stem  # e.g. "imerg_2024_ethiopia_0p25"
+    m = _re.search(r"(\d{4})", fname)
+    if m is None:
+        return ds  # can't determine year — leave as-is
+    year = int(m.group(1))
+    n_times = ds.sizes.get("time", 0)
+    if n_times == 0:
+        return ds
+    correct_times = pd.date_range(start=f"{year}-01-01", periods=n_times, freq="D")
+    ds = ds.assign_coords(time=correct_times)
+    return ds
+
+
 @st.cache_resource
 def open_dataset_folder(folder: str) -> Tuple[xr.Dataset, List[str]]:
     data_dir = Path(folder).expanduser().resolve()
     files = sorted(data_dir.glob(FILE_GLOB))
     if not files:
         raise FileNotFoundError(f"No {FILE_GLOB} files in {data_dir}")
-    ds_ = xr.open_mfdataset(
-        [str(f) for f in files],
-        combine="by_coords",
-        parallel=True,
-        chunks={"time": CHUNKSIZE},
-        engine=None,
-    )
+
+    folder_name = data_dir.name.upper()
+    is_imerg = folder_name == "IMERG"
+
+    if is_imerg:
+        # Open each file individually, fix its time axis, then combine
+        fixed = []
+        for f in files:
+            ds_f = xr.open_dataset(str(f), chunks={"time": CHUNKSIZE}, engine=None)
+            ds_f = _fix_imerg_time(ds_f, str(f))
+            fixed.append(ds_f)
+        ds_ = xr.concat(fixed, dim="time") if len(fixed) > 1 else fixed[0]
+    else:
+        ds_ = xr.open_mfdataset(
+            [str(f) for f in files],
+            combine="by_coords",
+            parallel=True,
+            chunks={"time": CHUNKSIZE},
+            engine=None,
+        )
     return ds_, [str(f) for f in files]
 
 
@@ -404,7 +448,8 @@ def extract_series_single_year(
         engine=None,
     )
     ds = maybe_normalize_longitudes(ds, lon_name)
-    da = ds[RAIN_VAR].sel({time_name: slice(f"{year}-01-01", f"{year}-12-31")})
+    rain_var = RAIN_VAR_BY_KEY.get(dataset_key, RAIN_VAR)
+    da = ds[rain_var].sel({time_name: slice(f"{year}-01-01", f"{year}-12-31")})
     da = da.sel({lat_name: lat0, lon_name: lon0}, method="nearest").compute()
     p_lat = float(da[lat_name].values)
     p_lon = float(da[lon_name].values)
@@ -433,7 +478,8 @@ def extract_climatology(
         engine=None,
     )
     ds = maybe_normalize_longitudes(ds, lon_name)
-    da = ds[RAIN_VAR].sel({time_name: slice(f"{y0}-01-01", f"{y1}-12-31")})
+    rain_var = RAIN_VAR_BY_KEY.get(dataset_key, RAIN_VAR)
+    da = ds[rain_var].sel({time_name: slice(f"{y0}-01-01", f"{y1}-12-31")})
     da = da.sel({lat_name: lat0, lon_name: lon0}, method="nearest").compute()
     p_lat = float(da[lat_name].values)
     p_lon = float(da[lon_name].values)
@@ -624,11 +670,15 @@ def compute_agg_doy_maps(
 
 def clip_and_mask_map(Z, lat_vals, lon_vals, eth_geom, eth_bounds, mask_da):
     lo_mn, la_mn, lo_mx, la_mx = eth_bounds
-    lat_sel = (lat_vals >= la_mn) & (lat_vals <= la_mx)
-    lon_sel = (lon_vals >= lo_mn) & (lon_vals <= lo_mx)
-    Z = Z[np.ix_(lat_sel, lon_sel)]
-    lat_vals = lat_vals[lat_sel]
-    lon_vals = lon_vals[lon_sel]
+    # Use integer indices to avoid np.ix_ shape mismatches
+    lat_idx = np.where((lat_vals >= la_mn) & (lat_vals <= la_mx))[0]
+    lon_idx = np.where((lon_vals >= lo_mn) & (lon_vals <= lo_mx))[0]
+    # Clamp to actual array bounds
+    lat_idx = lat_idx[lat_idx < Z.shape[0]]
+    lon_idx = lon_idx[lon_idx < Z.shape[1]]
+    Z = Z[np.ix_(lat_idx, lon_idx)]
+    lat_vals = lat_vals[lat_idx]
+    lon_vals = lon_vals[lon_idx]
     inside = make_inside_mask(lat_vals, lon_vals, eth_geom)
     Z = np.where(inside, Z, np.nan)
     if mask_da is not None:
@@ -991,25 +1041,47 @@ if has_station:
     emi_meta, emi_ts = load_emi_station_csv(STATION_CSV_PATH)
 
 # ── Shared year range ──
-year_ranges = []
+year_ranges = {}
 for key in selected_grids:
     _, _, ti = COORDS_BY_KEY[key]
-    year_ranges.append(dataset_year_range(DS_BY_KEY[key], ti))
+    year_ranges[key] = dataset_year_range(DS_BY_KEY[key], ti)
 if has_station and emi_ts is not None:
-    year_ranges.append((int(emi_ts.index.min().year), int(emi_ts.index.max().year)))
+    year_ranges[STATION_KEY] = (
+        int(emi_ts.index.min().year),
+        int(emi_ts.index.max().year),
+    )
 
 if not year_ranges:
     st.error("No data available.")
     st.stop()
 
-year_min = max(r[0] for r in year_ranges)
-year_max = min(r[1] for r in year_ranges)
+range_list = list(year_ranges.values())
+year_min = max(r[0] for r in range_list)
+year_max = min(r[1] for r in range_list)
+
 if year_min > year_max:
-    st.error("Selected datasets have no overlapping years.")
+    st.error(
+        "Selected datasets have no overlapping years. Their individual ranges are:"
+    )
+    for key, (y0, y1) in year_ranges.items():
+        st.error(f"  • {key}: {y0}–{y1}")
     st.stop()
 
+# Warn if the intersection is narrower than any individual dataset
+if len(year_ranges) > 1:
+    msgs = []
+    for key, (y0, y1) in year_ranges.items():
+        if y0 > year_min or y1 < year_max:
+            msgs.append(f"**{key}**: {y0}–{y1}")
+    if msgs:
+        st.info(
+            f"Year selector limited to the overlapping range **{year_min}–{year_max}** "
+            f"across all selected datasets. Individual ranges: {', '.join(msgs)}."
+        )
+
 year_list = list(range(year_min, year_max + 1))
-year_default = min(max(2000, year_min), year_max)
+# Pick a sensible default: prefer a recent-ish year within range
+year_default = min(max(year_max - 5, year_min), year_max)
 
 # ── Grid domain (only needed when grids are selected) ──
 if selected_grids:
@@ -1255,9 +1327,8 @@ if selected_grids and not has_station:
             fi = FILES_BY_KEY[key]
             ds_i = DS_BY_KEY[key]
             if map_kind == "Seasonal mean rainfall (JJAS)":
-                da = ds_i[RAIN_VAR].sel(
-                    {ti: slice(f"{map_y0}-01-01", f"{map_y1}-12-31")}
-                )
+                _rv = RAIN_VAR_BY_KEY.get(key, RAIN_VAR)
+                da = ds_i[_rv].sel({ti: slice(f"{map_y0}-01-01", f"{map_y1}-12-31")})
                 da = (
                     da.where(da[ti].dt.month.isin([6, 7, 8, 9]), drop=True)
                     .mean(dim=ti)
@@ -1275,7 +1346,8 @@ if selected_grids and not has_station:
                     "rain",
                 )
             elif map_kind == "Daily rainfall map (selected date)":
-                da = ds_i[RAIN_VAR].sel({ti: date_sel}, method="nearest").compute()
+                _rv = RAIN_VAR_BY_KEY.get(key, RAIN_VAR)
+                da = ds_i[_rv].sel({ti: date_sel}, method="nearest").compute()
                 return (
                     clip_and_mask_map(
                         da.values,
@@ -1289,9 +1361,10 @@ if selected_grids and not has_station:
                 )
             else:
                 if map_year_mode == "Single year":
+                    _rv = RAIN_VAR_BY_KEY.get(key, RAIN_VAR)
                     lv, lov, wd, od = compute_single_year_doy_maps(
                         tuple(fi),
-                        RAIN_VAR,
+                        _rv,
                         la,
                         lo,
                         ti,
@@ -1307,9 +1380,10 @@ if selected_grids and not has_station:
                         int(end_day),
                     )
                 else:
+                    _rv = RAIN_VAR_BY_KEY.get(key, RAIN_VAR)
                     lv, lov, wd, od = compute_agg_doy_maps(
                         tuple(fi),
-                        RAIN_VAR,
+                        _rv,
                         la,
                         lo,
                         ti,
@@ -1370,97 +1444,120 @@ if selected_grids and not has_station:
                 )
             st.pyplot(fig_m)
 
-        else:  # both CHIRPS + ENACTS
-            (lv1, lov1, Z1), kind1 = get_map_Z("CHIRPS")
-            (lv2, lov2, Z2), kind2 = get_map_Z("ENACTS")
-            same_shape = Z1.shape == Z2.shape
-            if not same_shape:
-                st.warning(
-                    f"Grid shapes differ after clipping "
-                    f"(CHIRPS {Z1.shape} vs ENACTS {Z2.shape}). "
-                    "Difference map unavailable — showing individual maps only."
+        else:
+            # Generic N-grid layout: individual maps + pairwise differences, all in one row
+            from itertools import combinations
+
+            results = {key: get_map_Z(key) for key in selected_grids}
+
+            n = len(selected_grids)
+            pairs = list(combinations(selected_grids, 2))
+            n_cols = n + len(pairs)
+            # All maps use the same fixed size so they render identically in their columns
+            fig_w, fig_h = 4, 4
+
+            all_Z_rain = [
+                results[k][0][2] for k in selected_grids if results[k][1] == "rain"
+            ]
+            vmin_shared = vmax_shared = None
+            if len(all_Z_rain) > 1:
+                vmin_shared, vmax_shared = _nanminmax(
+                    np.concatenate([z.ravel() for z in all_Z_rain])
                 )
 
-            cols = st.columns(3) if same_shape else st.columns(2)
-            vmin12 = vmax12 = None
-            if kind1 == "rain" and same_shape:
-                vmin12, vmax12 = _nanminmax(np.concatenate([Z1.ravel(), Z2.ravel()]))
+            all_cols = st.columns(n_cols)
 
-            with cols[0]:
-                st.markdown("### CHIRPS")
-                fig_m, ax = plt.subplots(figsize=(5, 4))
-                Lon, Lat = np.meshgrid(lov1, lv1)
-                if kind1 == "rain":
-                    plot_rain_map(
-                        ax,
-                        Lon,
-                        Lat,
-                        Z1,
-                        eth,
-                        f"CHIRPS — {yr_label}",
-                        "mm/day",
-                        fig_m,
-                        vmin12,
-                        vmax12,
-                    )
-                else:
-                    plot_doy_map(
-                        ax,
-                        Lon,
-                        Lat,
-                        Z1,
-                        eth,
-                        f"CHIRPS — {yr_label}",
-                        "DOY",
-                        cmap_jjas,
-                        norm_jjas,
-                        tpos,
-                        tlbl,
-                        fig_m,
-                    )
-                st.pyplot(fig_m)
+            # ── Individual dataset maps ──
+            for ci, key in enumerate(selected_grids):
+                (lv, lov, Z), kind = results[key]
+                with all_cols[ci]:
+                    st.markdown(f"**{key}**")
+                    fig_m, ax = plt.subplots(figsize=(fig_w, fig_h))
+                    Lon, Lat = np.meshgrid(lov, lv)
+                    if kind == "rain":
+                        plot_rain_map(
+                            ax,
+                            Lon,
+                            Lat,
+                            Z,
+                            eth,
+                            f"{key} — {yr_label}",
+                            "mm/day",
+                            fig_m,
+                            vmin_shared,
+                            vmax_shared,
+                        )
+                    else:
+                        cb_lbl = (
+                            "Wet Spell DOY"
+                            if map_kind == "Wet spell date (DOY)"
+                            else "Onset DOY"
+                        )
+                        plot_doy_map(
+                            ax,
+                            Lon,
+                            Lat,
+                            Z,
+                            eth,
+                            f"{key} — {yr_label}",
+                            cb_lbl,
+                            cmap_jjas,
+                            norm_jjas,
+                            tpos,
+                            tlbl,
+                            fig_m,
+                        )
+                    st.pyplot(fig_m)
 
-            with cols[1]:
-                st.markdown("### ENACTS")
-                fig_m, ax = plt.subplots(figsize=(5, 4))
-                Lon, Lat = np.meshgrid(lov2, lv2)
-                if kind2 == "rain":
-                    plot_rain_map(
-                        ax,
-                        Lon,
-                        Lat,
-                        Z2,
-                        eth,
-                        f"ENACTS — {yr_label}",
-                        "mm/day",
-                        fig_m,
-                        vmin12,
-                        vmax12,
-                    )
-                else:
-                    plot_doy_map(
-                        ax,
-                        Lon,
-                        Lat,
-                        Z2,
-                        eth,
-                        f"ENACTS — {yr_label}",
-                        "DOY",
-                        cmap_jjas,
-                        norm_jjas,
-                        tpos,
-                        tlbl,
-                        fig_m,
-                    )
-                st.pyplot(fig_m)
+            # ── Pairwise difference maps, continuing in the same row ──
+            for pi, (kA, kB) in enumerate(pairs):
+                (lvA, lovA, ZA), kindA = results[kA]
+                (lvB, lovB, ZB), _ = results[kB]
+                with all_cols[n + pi]:
+                    st.markdown(f"**{kA} − {kB}**")
+                    # Auto-regrid finer grid onto coarser grid if shapes differ
+                    if ZA.shape != ZB.shape:
+                        # Use scipy RegularGridInterpolator to resample the finer onto the coarser
+                        from scipy.interpolate import RegularGridInterpolator
 
-            if same_shape:
-                with cols[2]:
-                    st.markdown("### CHIRPS − ENACTS")
-                    Zdiff = Z1 - Z2
-                    fig_m, ax = plt.subplots(figsize=(5, 4))
-                    Lon, Lat = np.meshgrid(lov1, lv1)
-                    if kind1 == "rain":
+                        # Decide which is coarser (fewer points = coarser)
+                        if ZA.size >= ZB.size:
+                            # ZA is finer — resample ZA onto ZB's grid
+                            interp = RegularGridInterpolator(
+                                (lvA, lovA),
+                                ZA,
+                                method="linear",
+                                bounds_error=False,
+                                fill_value=np.nan,
+                            )
+                            LonG, LatG = np.meshgrid(lovB, lvB)
+                            ZA = interp(
+                                np.stack([LatG.ravel(), LonG.ravel()], axis=1)
+                            ).reshape(LonG.shape)
+                            lvA, lovA = lvB, lovB
+                            st.caption(
+                                f"ℹ️ {kA} resampled to {kB} resolution for difference map"
+                            )
+                        else:
+                            # ZB is finer — resample ZB onto ZA's grid
+                            interp = RegularGridInterpolator(
+                                (lvB, lovB),
+                                ZB,
+                                method="linear",
+                                bounds_error=False,
+                                fill_value=np.nan,
+                            )
+                            LonG, LatG = np.meshgrid(lovA, lvA)
+                            ZB = interp(
+                                np.stack([LatG.ravel(), LonG.ravel()], axis=1)
+                            ).reshape(LonG.shape)
+                            st.caption(
+                                f"ℹ️ {kB} resampled to {kA} resolution for difference map"
+                            )
+                    Zdiff = ZA - ZB
+                    fig_m, ax = plt.subplots(figsize=(fig_w, fig_h))
+                    Lon, Lat = np.meshgrid(lovA, lvA)
+                    if kindA == "rain":
                         ma = float(np.nanmax(np.abs(Zdiff))) or 1e-6
                         pcm = ax.pcolormesh(
                             Lon,
@@ -1473,9 +1570,9 @@ if selected_grids and not has_station:
                         eth.boundary.plot(
                             ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10
                         )
-                        ax.set_title(f"Difference — {yr_label}", fontsize=9)
+                        ax.set_title(f"{kA}−{kB} — {yr_label}", fontsize=9)
                         cb = fig_m.colorbar(pcm, ax=ax)
-                        cb.set_label("mm/day (CHIRPS−ENACTS)", fontsize=8)
+                        cb.set_label(f"mm/day ({kA}−{kB})", fontsize=8)
                     else:
                         lvls = np.arange(-30, 31, 5)
                         pcm = ax.pcolormesh(
@@ -1489,9 +1586,9 @@ if selected_grids and not has_station:
                         eth.boundary.plot(
                             ax=ax, linewidth=LINEWIDTH_ETH, edgecolor="black", zorder=10
                         )
-                        ax.set_title(f"DOY Difference — {yr_label}", fontsize=9)
+                        ax.set_title(f"DOY diff {kA}−{kB} — {yr_label}", fontsize=9)
                         cb = fig_m.colorbar(pcm, ax=ax, ticks=lvls)
-                        cb.set_label("DOY (CHIRPS−ENACTS)", fontsize=8)
+                        cb.set_label(f"DOY ({kA}−{kB})", fontsize=8)
                     ax.set_xlabel("Lon")
                     ax.set_ylabel("Lat")
                     st.pyplot(fig_m)

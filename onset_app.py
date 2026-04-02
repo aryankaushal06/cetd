@@ -322,11 +322,11 @@ def detect_first_wet_spell(
     for t in range(si, max(si, stop)):
         win = r[t : t + accum_days]
         if np.nansum(win) >= accum_mm and not np.any(win < wet_day_mm):
-            return d.iloc[t], t
-    return None, None
+            return d.iloc[t], t, si  # si returned so callers can floor the walkback
+    return None, None, si
 
 
-def wet_spell_start_from_idx(dates, rain, idx, wet_day_mm):
+def wet_spell_start_from_idx(dates, rain, idx, wet_day_mm, search_start_idx=0):
     if idx is None:
         return None
     r = np.asarray(rain, dtype=float)
@@ -336,7 +336,8 @@ def wet_spell_start_from_idx(dates, rain, idx, wet_day_mm):
     if r[idx] < wet_day_mm:
         return d.iloc[idx]
     j = idx
-    while j - 1 >= 0 and r[j - 1] >= wet_day_mm:
+    # Walk back through consecutive wet days, but never before the search window start
+    while j - 1 >= search_start_idx and r[j - 1] >= wet_day_mm:
         j -= 1
     return d.iloc[j]
 
@@ -552,7 +553,7 @@ def compute_single_year_doy_maps(
     for i in range(R.shape[1]):
         for j in range(R.shape[2]):
             rij = R[:, i, j]
-            _, wi = detect_first_wet_spell(
+            _, wi, si_ws = detect_first_wet_spell(
                 pd.Series(times),
                 rij,
                 float(wet_day_mm),
@@ -563,7 +564,9 @@ def compute_single_year_doy_maps(
                 int(end_month),
                 int(end_day),
             )
-            ws = wet_spell_start_from_idx(pd.Series(times), rij, wi, float(wet_day_mm))
+            ws = wet_spell_start_from_idx(
+                pd.Series(times), rij, wi, float(wet_day_mm), si_ws
+            )
             if ws is not None:
                 wm[i, j] = float(pd.Timestamp(ws).dayofyear)
             od, _ = detect_onset(
@@ -625,7 +628,7 @@ def compute_agg_doy_maps(
         for i in range(R.shape[1]):
             for j in range(R.shape[2]):
                 rij = R[:, i, j]
-                _, wi = detect_first_wet_spell(
+                _, wi, si_ws = detect_first_wet_spell(
                     pd.Series(times),
                     rij,
                     float(wet_day_mm),
@@ -637,7 +640,7 @@ def compute_agg_doy_maps(
                     int(end_day),
                 )
                 ws = wet_spell_start_from_idx(
-                    pd.Series(times), rij, wi, float(wet_day_mm)
+                    pd.Series(times), rij, wi, float(wet_day_mm), si_ws
                 )
                 if ws is not None:
                     wm[i, j] = float(pd.Timestamp(ws).dayofyear)
@@ -793,7 +796,7 @@ def add_wetspell_onset_traces(fig, df_ts, dataset_key, label_prefix):
     if not np.any(np.isfinite(rain)):
         return
 
-    _, wi = detect_first_wet_spell(
+    _, wi, si_ws = detect_first_wet_spell(
         times,
         rain,
         float(wet_day_mm),
@@ -804,7 +807,7 @@ def add_wetspell_onset_traces(fig, df_ts, dataset_key, label_prefix):
         int(end_month),
         int(end_day),
     )
-    ws = wet_spell_start_from_idx(times, rain, wi, float(wet_day_mm))
+    ws = wet_spell_start_from_idx(times, rain, wi, float(wet_day_mm), si_ws)
 
     od, _ = detect_onset(
         times,

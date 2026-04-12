@@ -75,13 +75,21 @@ lookahead_days = st.sidebar.number_input(
 )
 
 st.sidebar.subheader("Search window")
-start_month = st.sidebar.selectbox("Search start month", list(range(1, 13)), index=0)
-start_day = st.sidebar.number_input(
-    "Search start day", min_value=1, max_value=31, value=1, step=1
+clip_ts_to_window = st.sidebar.toggle(
+    "Clip timeseries to search window",
+    value=True,
+    help="When on, the timeseries x-axis is limited to the search window. "
+    "Turn off to show the full year.",
 )
-end_month = st.sidebar.selectbox("Search end month", list(range(1, 13)), index=11)
+start_month = st.sidebar.selectbox(
+    "Search start month", list(range(1, 13)), index=4
+)  # May
+start_day = st.sidebar.number_input(
+    "Search start day", min_value=1, max_value=31, value=15, step=1
+)
+end_month = st.sidebar.selectbox("Search end month", list(range(1, 13)), index=9)  # Oct
 end_day = st.sidebar.number_input(
-    "Search end day", min_value=1, max_value=31, value=31, step=1
+    "Search end day", min_value=1, max_value=31, value=15, step=1
 )
 
 
@@ -544,12 +552,15 @@ def compute_single_year_doy_maps(
     )
     ds = maybe_normalize_longitudes(ds, lon_name)
     da = ds[var].sel({time_name: slice(f"{year}-01-01", f"{year}-12-31")}).compute()
+    # Drop duplicate coordinate values that can arise from multi-file combines
+    da = da.drop_duplicates(lat_name).drop_duplicates(lon_name)
     lv = da[lat_name].values
     lov = da[lon_name].values
     R = da.values
     times = pd.to_datetime(da[time_name].values)
-    wm = np.full((len(lv), len(lov)), np.nan)
-    om = np.full((len(lv), len(lov)), np.nan)
+    # Size wm/om from R.shape to guarantee consistency with data dimensions
+    wm = np.full((R.shape[1], R.shape[2]), np.nan)
+    om = np.full((R.shape[1], R.shape[2]), np.nan)
     for i in range(R.shape[1]):
         for j in range(R.shape[2]):
             rij = R[:, i, j]
@@ -616,6 +627,8 @@ def compute_agg_doy_maps(
     )
     ds = maybe_normalize_longitudes(ds, lon_name)
     da_all = ds[var].sel({time_name: slice(f"{y0}-01-01", f"{y1}-12-31")})
+    # Drop duplicate coordinate values that can arise from multi-file combines
+    da_all = da_all.drop_duplicates(lat_name).drop_duplicates(lon_name)
     lv = da_all[lat_name].values
     lov = da_all[lon_name].values
     wl, ol = [], []
@@ -623,8 +636,8 @@ def compute_agg_doy_maps(
         da = da_all.sel({time_name: slice(f"{yy}-01-01", f"{yy}-12-31")}).compute()
         R = da.values
         times = pd.to_datetime(da[time_name].values)
-        wm = np.full((len(lv), len(lov)), np.nan)
-        om = np.full((len(lv), len(lov)), np.nan)
+        wm = np.full((R.shape[1], R.shape[2]), np.nan)
+        om = np.full((R.shape[1], R.shape[2]), np.nan)
         for i in range(R.shape[1]):
             for j in range(R.shape[2]):
                 rij = R[:, i, j]
@@ -739,6 +752,21 @@ def plot_rain_map(
 # ─────────────────────────────────────────────
 # Plotly timeseries helpers (interactive legend)
 # ─────────────────────────────────────────────
+def _ts_xaxis_range(year: int, clip: bool):
+    """Return Plotly xaxis range dict clipped to the search window, or None for full year.
+    Uses a reference year of 2001 for climatology mode (DOY-based x-axis)."""
+    if not clip:
+        return None
+    try:
+        x0 = pd.Timestamp(year=year, month=int(start_month), day=int(start_day))
+        x1 = pd.Timestamp(year=year, month=int(end_month), day=int(end_day))
+        # Add a small pad so onset/wet spell lines on boundary dates are visible
+        pad = pd.Timedelta(days=3)
+        return [x0 - pad, x1 + pad]
+    except Exception:
+        return None
+
+
 def build_plotly_ts(title: str) -> go.Figure:
     fig = go.Figure()
     fig.update_layout(
@@ -1140,15 +1168,16 @@ if selected_grids and not has_station:
 
     # ── ② Select View(s) ──
     st.subheader("② Select View(s)")
-    show_ts = st.checkbox("Timeseries", value=True, key="show_ts_a")
-    show_map = st.checkbox("Map (Ethiopia)", value=True, key="show_map_a")
-    if not show_ts and not show_map:
+    show_ts = st.toggle("Timeseries", value=True, key="show_ts_a")
+    show_map = st.toggle("Map (Ethiopia)", value=True, key="show_map_a")
+    show_stats = st.toggle("Statistics", value=True, key="show_stats_a")
+    if not show_ts and not show_map and not show_stats:
         st.warning("Select at least one view.")
         st.stop()
 
     # Link toggle — only shown when both views are active
     if show_ts and show_map:
-        link_periods = st.checkbox(
+        link_periods = st.toggle(
             "🔗 Link Timeseries and Map Time Period",
             value=True,
             key="link_periods_a",
@@ -1269,7 +1298,7 @@ if selected_grids and not has_station:
     # ── Map options — only when map is active ──
     if show_map:
         st.subheader("⑤ Map options")
-        use_default_mask = st.checkbox(
+        use_default_mask = st.toggle(
             "Apply Ethiopia .nc mask", value=True, key="mask_a"
         )
         map_kind = st.radio(
@@ -1277,8 +1306,8 @@ if selected_grids and not has_station:
             [
                 "Seasonal mean rainfall (JJAS)",
                 "Daily rainfall map (selected date)",
-                "Wet spell date (DOY)",
-                "Onset date (DOY)",
+                "Wet spell date",
+                "Onset date",
             ],
             horizontal=True,
             key="a_map_kind",
@@ -1341,6 +1370,11 @@ if selected_grids and not has_station:
         # Threshold added once after all datasets
         if last_times is not None:
             add_wet_threshold_trace(fig_ts, float(wet_day_mm), last_times)
+        # Apply search-window clip to x-axis if toggle is on
+        _ref_yr = ts_y0 if ts_year_mode == "Single year" else 2001
+        _xr = _ts_xaxis_range(_ref_yr, clip_ts_to_window)
+        if _xr:
+            fig_ts.update_layout(xaxis_range=_xr)
         st.plotly_chart(fig_ts, use_container_width=True)
 
     # ── MAP PANEL ──
@@ -1431,7 +1465,7 @@ if selected_grids and not has_station:
                         int(end_month),
                         int(end_day),
                     )
-                Z0 = wd if map_kind == "Wet spell date (DOY)" else od
+                Z0 = wd if map_kind == "Wet spell date" else od
                 return (
                     clip_and_mask_map(Z0, lv, lov, eth_geom, eth_bounds, mask_da),
                     "doy",
@@ -1455,9 +1489,7 @@ if selected_grids and not has_station:
                 )
             else:
                 cb_lbl = (
-                    "Wet Spell DOY"
-                    if map_kind == "Wet spell date (DOY)"
-                    else "Onset DOY"
+                    "Wet spell date" if map_kind == "Wet spell date" else "Onset date"
                 )
                 plot_doy_map(
                     ax,
@@ -1481,23 +1513,122 @@ if selected_grids and not has_station:
 
             results = {key: get_map_Z(key) for key in selected_grids}
 
+            # ── Align all grids to a common lat/lon so difference maps are always same shape ──
+            # Use the grid with the most points as the reference (finest effective coverage).
+            # All datasets should be 0.25° but may have slightly different offsets after clipping,
+            # causing shape mismatches. We interpolate every grid onto one shared reference.
+            ref_key = max(
+                selected_grids,
+                key=lambda k: results[k][0][2].size - np.isnan(results[k][0][2]).sum(),
+            )
+            ref_lv, ref_lov, _, _ = (
+                results[ref_key][0][0],
+                results[ref_key][0][1],
+                None,
+                None,
+            )
+            ref_lv = results[ref_key][0][0]
+            ref_lov = results[ref_key][0][1]
+
+            def _snap_to_ref(lv, lov, Z):
+                """Bilinearly interpolate Z onto the reference grid if shapes differ."""
+                if (
+                    lv.shape == ref_lv.shape
+                    and lov.shape == ref_lov.shape
+                    and np.allclose(lv, ref_lv, atol=1e-4)
+                    and np.allclose(lov, ref_lov, atol=1e-4)
+                ):
+                    return ref_lv, ref_lov, Z
+                from scipy.interpolate import RegularGridInterpolator
+
+                interp = RegularGridInterpolator(
+                    (lv, lov), Z, method="linear", bounds_error=False, fill_value=np.nan
+                )
+                LonG, LatG = np.meshgrid(ref_lov, ref_lv)
+                Z_new = interp(np.stack([LatG.ravel(), LonG.ravel()], axis=1)).reshape(
+                    LonG.shape
+                )
+                return ref_lv, ref_lov, Z_new
+
+            aligned = {}
+            for key in selected_grids:
+                (lv, lov, Z), kind = results[key]
+                lv2, lov2, Z2 = _snap_to_ref(lv, lov, Z)
+                aligned[key] = ((lv2, lov2, Z2), kind)
+            results = aligned
+
             n = len(selected_grids)
             pairs = list(combinations(selected_grids, 2))
             n_cols = n + len(pairs)
-            # All maps use the same fixed size so they render identically in their columns
             fig_w, fig_h = 4, 4
 
+            # ── Scale toggles ──
+            has_rain_maps = any(results[k][1] == "rain" for k in selected_grids)
+            has_doy_maps = any(results[k][1] == "doy" for k in selected_grids)
+            # DOY maps always share the same fixed JJAS colormap — no toggle needed
+            shared_rain_scale = True
+            shared_diff_scale = True
+            if has_rain_maps and n > 1:
+                shared_rain_scale = st.toggle(
+                    "Shared scale across rainfall maps",
+                    value=True,
+                    key="shared_rain_scale",
+                    help="When on, all individual rainfall maps use the same min/max colour scale.",
+                )
+            if (
+                len(pairs) > 1
+                and has_rain_maps
+                and map_kind
+                in (
+                    "Seasonal mean rainfall (JJAS)",
+                    "Daily rainfall map (selected date)",
+                )
+            ):
+                shared_diff_scale = st.toggle(
+                    "Shared scale across difference maps",
+                    value=True,
+                    key="shared_diff_scale",
+                    help="When on, all difference maps use the same diverging colour scale.",
+                )
+
+            # Compute shared ranges
             all_Z_rain = [
                 results[k][0][2] for k in selected_grids if results[k][1] == "rain"
             ]
             vmin_shared = vmax_shared = None
-            if len(all_Z_rain) > 1:
+            if shared_rain_scale and len(all_Z_rain) > 1:
                 vmin_shared, vmax_shared = _nanminmax(
                     np.concatenate([z.ravel() for z in all_Z_rain])
                 )
 
+            # Pre-compute all difference arrays to find shared diff scale
+            diff_results = {}
+            for kA, kB in pairs:
+                (lvA, lovA, ZA), kindA = results[kA]
+                (lvB, lovB, ZB), _ = results[kB]
+                diff_results[(kA, kB)] = (lvA, lovA, ZA - ZB, kindA)
+
+            diff_ma_shared = None  # shared symmetric limit for rain diff maps
+            diff_doy_lvls = np.arange(-30, 31, 5)  # fixed for DOY diffs
+            if shared_diff_scale and len(pairs) > 1:
+                rain_diffs = [
+                    np.abs(diff_results[p][2])
+                    for p in pairs
+                    if diff_results[p][3] == "rain"
+                ]
+                if rain_diffs:
+                    diff_ma_shared = (
+                        float(
+                            max(
+                                np.nanmax(d)
+                                for d in rain_diffs
+                                if np.any(np.isfinite(d))
+                            )
+                        )
+                        or 1e-6
+                    )
+
             # Build a flat ordered list of all panels: individual maps first, then diffs
-            # Each entry: ("individual", key) or ("diff", kA, kB)
             panels = [("individual", key) for key in selected_grids]
             panels += [("diff", kA, kB) for kA, kB in pairs]
 
@@ -1516,6 +1647,8 @@ if selected_grids and not has_station:
                             fig_m, ax = plt.subplots(figsize=(fig_w, fig_h))
                             Lon, Lat = np.meshgrid(lov, lv)
                             if kind == "rain":
+                                vm0 = vmin_shared if shared_rain_scale else None
+                                vm1 = vmax_shared if shared_rain_scale else None
                                 plot_rain_map(
                                     ax,
                                     Lon,
@@ -1525,14 +1658,14 @@ if selected_grids and not has_station:
                                     f"{key} — {yr_label}",
                                     "mm/day",
                                     fig_m,
-                                    vmin_shared,
-                                    vmax_shared,
+                                    vm0,
+                                    vm1,
                                 )
                             else:
                                 cb_lbl = (
-                                    "Wet Spell DOY"
-                                    if map_kind == "Wet spell date (DOY)"
-                                    else "Onset DOY"
+                                    "Wet spell date"
+                                    if map_kind == "Wet spell date"
+                                    else "Onset date"
                                 )
                                 plot_doy_map(
                                     ax,
@@ -1552,48 +1685,15 @@ if selected_grids and not has_station:
 
                         else:  # diff panel
                             _, kA, kB = panel
-                            (lvA, lovA, ZA), kindA = results[kA]
-                            (lvB, lovB, ZB), _ = results[kB]
+                            lvA, lovA, Zdiff, kindA = diff_results[(kA, kB)]
                             st.markdown(f"**{kA} − {kB}**")
-
-                            # Auto-regrid finer onto coarser if shapes differ
-                            resample_note = None
-                            if ZA.shape != ZB.shape:
-                                from scipy.interpolate import RegularGridInterpolator
-
-                                if ZA.size >= ZB.size:
-                                    interp = RegularGridInterpolator(
-                                        (lvA, lovA),
-                                        ZA,
-                                        method="linear",
-                                        bounds_error=False,
-                                        fill_value=np.nan,
-                                    )
-                                    LonG, LatG = np.meshgrid(lovB, lvB)
-                                    ZA = interp(
-                                        np.stack([LatG.ravel(), LonG.ravel()], axis=1)
-                                    ).reshape(LonG.shape)
-                                    lvA, lovA = lvB, lovB
-                                    resample_note = f"ℹ️ {kA} resampled to {kB} resolution for difference map"
-                                else:
-                                    interp = RegularGridInterpolator(
-                                        (lvB, lovB),
-                                        ZB,
-                                        method="linear",
-                                        bounds_error=False,
-                                        fill_value=np.nan,
-                                    )
-                                    LonG, LatG = np.meshgrid(lovA, lvA)
-                                    ZB = interp(
-                                        np.stack([LatG.ravel(), LonG.ravel()], axis=1)
-                                    ).reshape(LonG.shape)
-                                    resample_note = f"ℹ️ {kB} resampled to {kA} resolution for difference map"
-
-                            Zdiff = ZA - ZB
                             fig_m, ax = plt.subplots(figsize=(fig_w, fig_h))
                             Lon, Lat = np.meshgrid(lovA, lvA)
                             if kindA == "rain":
-                                ma = float(np.nanmax(np.abs(Zdiff))) or 1e-6
+                                if shared_diff_scale and diff_ma_shared is not None:
+                                    ma = diff_ma_shared
+                                else:
+                                    ma = float(np.nanmax(np.abs(Zdiff))) or 1e-6
                                 pcm = ax.pcolormesh(
                                     Lon,
                                     Lat,
@@ -1628,16 +1728,322 @@ if selected_grids and not has_station:
                                     zorder=10,
                                 )
                                 ax.set_title(
-                                    f"DOY diff {kA}−{kB} — {yr_label}", fontsize=9
+                                    f"{kA}−{kB} difference — {yr_label}", fontsize=9
                                 )
                                 cb = fig_m.colorbar(pcm, ax=ax, ticks=lvls)
-                                cb.set_label(f"DOY ({kA}−{kB})", fontsize=8)
+                                cb.set_label(f"Days ({kA}−{kB})", fontsize=8)
                             ax.set_xlabel("Lon")
                             ax.set_ylabel("Lat")
                             st.pyplot(fig_m)
-                            # Caption appears below the map
-                            if resample_note:
-                                st.caption(resample_note)
+
+    # ══════════════════════════════════════════
+    # ⑥ Statistics (standalone section)
+    # ══════════════════════════════════════════
+    if show_stats:
+        st.divider()
+        st.subheader("⑥ Statistics")
+        st.caption(
+            "Point-level statistics computed at the selected lat/lon over a chosen year range. "
+            "Uses the same search window as onset detection."
+        )
+
+        if not show_ts:
+            st.info("Enable the Timeseries view and select a point to use Statistics.")
+        else:
+            # ── Year range for stats ──
+            cSA, cSB = st.columns(2)
+            with cSA:
+                stat_y0 = int(
+                    st.selectbox("Stats start year", year_list, index=0, key="stat_y0")
+                )
+            with cSB:
+                stat_y1 = int(
+                    st.selectbox(
+                        "Stats end year",
+                        year_list,
+                        index=len(year_list) - 1,
+                        key="stat_y1",
+                    )
+                )
+            if stat_y1 <= stat_y0:
+                st.error("Stats end year must be > start year.")
+                st.stop()
+
+            # ── Per-chart toggles ──
+            col_t1, col_t2 = st.columns(2)
+            with col_t1:
+                show_onset_scatter = st.toggle(
+                    "Onset date scatter", value=True, key="show_onset_scatter"
+                )
+            with col_t2:
+                show_onset_dist = st.toggle(
+                    "Onset distribution", value=True, key="show_onset_dist"
+                )
+
+            # ── Shared cached functions ──
+            @st.cache_data(show_spinner="Computing onset dates…")
+            def compute_onset_series(
+                dataset_key,
+                ds_files,
+                lat_name,
+                lon_name,
+                time_name,
+                y0,
+                y1,
+                lat0,
+                lon0,
+                _wet_day_mm,
+                _accum_days,
+                _accum_mm,
+                _dry_spell_days,
+                _lookahead_days,
+                _start_month,
+                _start_day,
+                _end_month,
+                _end_day,
+            ):
+                import xarray as _xr
+
+                ds = _xr.open_mfdataset(
+                    ds_files,
+                    combine="by_coords",
+                    parallel=True,
+                    chunks={time_name: 365},
+                    engine=None,
+                )
+                ds = maybe_normalize_longitudes(ds, lon_name)
+                rain_var = RAIN_VAR_BY_KEY.get(dataset_key, RAIN_VAR)
+                records = []
+                for yy in range(y0, y1 + 1):
+                    da = ds[rain_var].sel(
+                        {time_name: slice(f"{yy}-01-01", f"{yy}-12-31")}
+                    )
+                    da = da.sel(
+                        {lat_name: lat0, lon_name: lon0}, method="nearest"
+                    ).compute()
+                    r = da.values.ravel().astype(float)
+                    times = pd.to_datetime(da[time_name].values)
+                    if len(times) == 0:
+                        continue
+                    od, _ = detect_onset(
+                        pd.Series(times),
+                        r,
+                        float(_wet_day_mm),
+                        int(_accum_days),
+                        float(_accum_mm),
+                        int(_dry_spell_days),
+                        int(_lookahead_days),
+                        int(_start_month),
+                        int(_start_day),
+                        int(_end_month),
+                        int(_end_day),
+                    )
+                    records.append(
+                        {
+                            "year": yy,
+                            "onset_doy": (
+                                float(pd.Timestamp(od).dayofyear) if od else np.nan
+                            ),
+                        }
+                    )
+                return pd.DataFrame(records)
+
+            def doy_to_label(doy):
+                try:
+                    return (
+                        pd.Timestamp("2001-01-01") + pd.Timedelta(days=int(doy) - 1)
+                    ).strftime("%d %b")
+                except Exception:
+                    return str(doy)
+
+            # ── Onset date scatter ──
+            if show_onset_scatter:
+                st.markdown("### Onset date scatter")
+                st.caption(
+                    "Onset DOY per year for each dataset at the selected point. "
+                    "Missing = no onset detected in that year's search window."
+                )
+                fig_sc = go.Figure()
+                for key in selected_grids:
+                    la, lo, ti = COORDS_BY_KEY[key]
+                    fi = FILES_BY_KEY[key]
+                    clr = DATASET_COLORS.get(key, {}).get("rain", "black")
+                    df_sc = compute_onset_series(
+                        key,
+                        tuple(fi),
+                        la,
+                        lo,
+                        ti,
+                        stat_y0,
+                        stat_y1,
+                        lat0,
+                        lon0,
+                        float(wet_day_mm),
+                        int(accum_days),
+                        float(accum_mm),
+                        int(dry_spell_days),
+                        int(lookahead_days),
+                        int(start_month),
+                        int(start_day),
+                        int(end_month),
+                        int(end_day),
+                    )
+                    if df_sc.empty:
+                        continue
+                    doy_dates = pd.to_datetime("2001-01-01") + pd.to_timedelta(
+                        df_sc["onset_doy"].fillna(0).astype(int) - 1, unit="D"
+                    )
+                    doy_labels = doy_dates.dt.strftime("%d %b").where(
+                        df_sc["onset_doy"].notna(), ""
+                    )
+                    fig_sc.add_trace(
+                        go.Scatter(
+                            x=df_sc["year"],
+                            y=df_sc["onset_doy"],
+                            mode="lines+markers",
+                            name=key,
+                            line=dict(color=clr, width=1.8),
+                            marker=dict(size=7, color=clr),
+                            text=doy_labels,
+                            hovertemplate="%{x}: DOY %{y} (%{text})<extra>"
+                            + key
+                            + "</extra>",
+                        )
+                    )
+                sw_doy0 = pd.Timestamp(
+                    year=2001, month=int(start_month), day=int(start_day)
+                ).dayofyear
+                sw_doy1 = pd.Timestamp(
+                    year=2001, month=int(end_month), day=int(end_day)
+                ).dayofyear
+                fig_sc.add_hrect(
+                    y0=sw_doy0,
+                    y1=sw_doy1,
+                    fillcolor="gray",
+                    opacity=0.08,
+                    line_width=0,
+                    annotation_text="Search window",
+                    annotation_position="left",
+                )
+                fig_sc.update_layout(
+                    title=f"Onset date per year — ({lat0:.3f}°N, {lon0:.3f}°E) — {stat_y0}–{stat_y1}",
+                    xaxis_title="Year",
+                    yaxis_title="Onset (DOY)",
+                    yaxis=dict(
+                        tickvals=[121, 152, 182, 213, 244, 265],
+                        ticktext=[
+                            "May 01",
+                            "Jun 01",
+                            "Jul 01",
+                            "Aug 01",
+                            "Sep 01",
+                            "Sep 22",
+                        ],
+                    ),
+                    height=420,
+                    legend=dict(orientation="h", y=-0.2),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_sc, use_container_width=True)
+
+            # ── Onset distribution ──
+            if show_onset_dist:
+                st.markdown("### Onset distribution")
+                st.caption(
+                    "Probability of onset in each 5-day bin. "
+                    "Years with no detected onset are excluded."
+                )
+                sw_start_doy = pd.Timestamp(
+                    year=2001, month=int(start_month), day=int(start_day)
+                ).dayofyear
+                sw_end_doy = pd.Timestamp(
+                    year=2001, month=int(end_month), day=int(end_day)
+                ).dayofyear
+                bin_edges = list(range(sw_start_doy, sw_end_doy + 1, 5))
+                if bin_edges[-1] < sw_end_doy:
+                    bin_edges.append(sw_end_doy + 1)
+                bin_centres = [
+                    (bin_edges[i] + bin_edges[i + 1]) / 2
+                    for i in range(len(bin_edges) - 1)
+                ]
+                bin_labels = [doy_to_label(c) for c in bin_centres]
+
+                fig_dist = go.Figure()
+                any_dist_data = False
+                for key in selected_grids:
+                    la, lo, ti = COORDS_BY_KEY[key]
+                    fi = FILES_BY_KEY[key]
+                    clr = DATASET_COLORS.get(key, {}).get("rain", "black")
+                    df_sc = compute_onset_series(
+                        key,
+                        tuple(fi),
+                        la,
+                        lo,
+                        ti,
+                        stat_y0,
+                        stat_y1,
+                        lat0,
+                        lon0,
+                        float(wet_day_mm),
+                        int(accum_days),
+                        float(accum_mm),
+                        int(dry_spell_days),
+                        int(lookahead_days),
+                        int(start_month),
+                        int(start_day),
+                        int(end_month),
+                        int(end_day),
+                    )
+                    if df_sc.empty:
+                        continue
+                    detected = df_sc["onset_doy"].dropna()
+                    if len(detected) == 0:
+                        continue
+                    counts = np.zeros(len(bin_edges) - 1)
+                    for doy in detected:
+                        for b in range(len(bin_edges) - 1):
+                            if bin_edges[b] <= doy < bin_edges[b + 1]:
+                                counts[b] += 1
+                                break
+                    probs = counts / len(detected)
+                    hover = [
+                        f"{doy_to_label(bin_edges[b])}–{doy_to_label(bin_edges[b+1]-1)}: "
+                        f"P={probs[b]:.2f} ({int(counts[b])}/{len(detected)} yrs)"
+                        for b in range(len(bin_edges) - 1)
+                    ]
+                    fig_dist.add_trace(
+                        go.Scatter(
+                            x=bin_labels,
+                            y=probs,
+                            mode="lines+markers",
+                            name=key,
+                            line=dict(color=clr, width=2),
+                            marker=dict(size=7, color=clr),
+                            text=hover,
+                            hovertemplate="%{text}<extra>" + key + "</extra>",
+                        )
+                    )
+                    any_dist_data = True
+
+                if not any_dist_data:
+                    st.info(
+                        "No onset dates detected for any dataset in this year range."
+                    )
+                else:
+                    fig_dist.update_layout(
+                        title=f"Onset distribution — ({lat0:.3f}°N, {lon0:.3f}°E) — {stat_y0}–{stat_y1}",
+                        xaxis_title="Onset date (5-day bins)",
+                        yaxis_title="Probability",
+                        yaxis=dict(range=[0, None], tickformat=".0%"),
+                        height=440,
+                        legend=dict(orientation="h", y=-0.25),
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_dist, use_container_width=True)
+                    st.caption(
+                        f"Probability = fraction of years with detected onset in that window. "
+                        f"{stat_y0}–{stat_y1} ({stat_y1-stat_y0+1} years)."
+                    )
 
 # ════════════════════════════════════════════
 # CASE B — EMI Stations only
@@ -1645,11 +2051,9 @@ if selected_grids and not has_station:
 elif has_station and not selected_grids:
 
     st.info("Map view is not available for EMI Stations. Showing timeseries only.")
-    # ── Interactive station map picker ──
     st.subheader("② Select EMI station")
     station_list = list(emi_meta.index)
 
-    # No default — None until user clicks
     if "selected_station" not in st.session_state:
         st.session_state["selected_station"] = None
 
@@ -1658,7 +2062,6 @@ elif has_station and not selected_grids:
         map_fig, use_container_width=True, on_select="rerun", key="station_map"
     )
 
-    # Handle click: extract station name from customdata
     if clicked and clicked.get("selection", {}).get("points"):
         pt = clicked["selection"]["points"][0]
         cd = pt.get("customdata")
@@ -1742,10 +2145,12 @@ elif has_station and not selected_grids:
         add_wetspell_onset_traces(fig_ts, clim, STATION_KEY, station_name)
         add_wet_threshold_trace(fig_ts, float(wet_day_mm), clim["time"])
 
+    _ref_yr = ts_y0 if ts_year_mode == "Single year" else 2001
+    _xr = _ts_xaxis_range(_ref_yr, clip_ts_to_window)
+    if _xr:
+        fig_ts.update_layout(xaxis_range=_xr)
     st.plotly_chart(fig_ts, use_container_width=True)
 
-
-# ════════════════════════════════════════════
 # CASE C — EMI Stations + grids
 # ════════════════════════════════════════════
 elif has_station and selected_grids:
@@ -1906,4 +2311,9 @@ elif has_station and selected_grids:
 
         add_wet_threshold_trace(fig_ts, float(wet_day_mm), clim_st["time"])
 
+    # Apply search-window clip to x-axis if toggle is on
+    _ref_yr = ts_y0 if ts_year_mode == "Single year" else 2001
+    _xr = _ts_xaxis_range(_ref_yr, clip_ts_to_window)
+    if _xr:
+        fig_ts.update_layout(xaxis_range=_xr)
     st.plotly_chart(fig_ts, use_container_width=True)

@@ -8,9 +8,10 @@ The app supports:
 - Automated onset detection based on accumulation + dry-spell constraints (ICPAC algorithm)
 - Wet-spell candidate identification
 - Seasonal and daily rainfall maps (Ethiopia-wide)
-- Pixel-level onset and wet spell DOY maps (single year or multi-year aggregation)
-- Pairwise dataset difference maps with automatic resolution resampling
+- Pixel-level onset and wet spell date maps (single year or multi-year aggregation)
+- Pairwise dataset difference maps with automatic grid alignment
 - EMI station timeseries with onset/wet spell detection and interactive station picker map
+- Point-level statistics: onset date scatter and onset probability distribution
 
 Built for climate onset diagnostics and exploratory research workflows.
 
@@ -22,9 +23,10 @@ Built for climate onset diagnostics and exploratory research workflows.
 CETD/
 │
 ├── app.py                                        # Main Streamlit application
+├── check_resolution.py                           # Inspect and compare resolution of all datasets
 ├── run_onset_app.py                              # One-command launcher (creates venv, installs deps)
 ├── make_ethiopia_geojson.py                      # Generates Ethiopia boundary GeoJSON
-├── RF_Station_Grid_Format.csv                    # EMI station daily rainfall data
+├── RF_Station_Grid_Format.csv                    # EMI station daily rainfall data (43 stations)
 ├── chirps_jjas_seasonal_mask_ethiopia_0p25.nc    # Optional Ethiopia JJAS seasonal mask
 │
 ├── data/
@@ -41,8 +43,6 @@ CETD/
 │
 ├── ERA5/
 │   └── era5_<year>_ethiopia_0p25.nc              # ERA5 daily rainfall NetCDF files
-│
-├── read_nc.py                                    # Inspect NetCDF datasets (variables, coords, dims)
 │
 ├── requirements.txt
 └── README.md
@@ -63,14 +63,14 @@ CETD/
 
 > **ENACTS note:** data outside May–October will appear as missing. JJAS maps and onset/wet spell detection are unaffected since they operate within this window, but full-year timeseries and non-JJAS maps will have gaps.
 
-> **IMERG / ERA5 note:** files produced by CDO remapping often have corrupted time coordinates. The app automatically corrects these at load time by extracting the year from each filename and reassigning a clean daily time axis.
+> **IMERG / ERA5 note:** files produced by CDO remapping can have corrupted time coordinates. The app automatically corrects these at load time by extracting the year from each filename and assigning a clean daily time axis.
 
 **EMI Station data (`RF_Station_Grid_Format.csv`)**
-- Daily rainfall for 26 Ethiopian stations, 1990–2020
+- Daily rainfall for 43 Ethiopian stations (merged from two source CSVs), 1990–2022
 - Format: rows = dates (`YYYYMMDD`), columns = station names
 - First rows: `LON` (longitude), `DAILY/LAT` (latitude), then daily data
 - Missing values encoded as `-99` (converted to NaN on load)
-- Station coverage varies — some stations have >50% missing data in certain years
+- Station coverage varies — some stations have significant missing data in certain years
 
 **Boundary**
 - Natural Earth Admin-0 countries
@@ -79,11 +79,23 @@ CETD/
 
 ---
 
+## Resolution Check
+
+Run `check_resolution.py` from the project root to inspect and compare the spatial resolution, coordinate names, grid dimensions, and time range of all four gridded datasets, plus the EMI station CSV:
+
+```bash
+python check_resolution.py
+```
+
+The script prints a comparison table and flags any resolution mismatches between datasets. All four gridded datasets are expected to share the same 0.25° resolution.
+
+---
+
 ## Features
 
 ### 1. Dataset Selection
 
-The app supports any combination of the four gridded datasets plus EMI Stations. The selected combination determines which views are available:
+The app supports any combination of the four gridded datasets plus EMI Stations:
 
 | Selection | Timeseries | Map view |
 |---|---|---|
@@ -98,14 +110,15 @@ When datasets with different temporal ranges are combined, the year selector is 
 
 ### 2. Select View(s)
 
-When one or more grid datasets are selected (without EMI Stations), the user can independently toggle:
+When one or more grid datasets are selected (without EMI Stations), three views can be independently toggled:
 
 - **Timeseries** — point-level chart for a selected lat/lon
 - **Map (Ethiopia)** — country-wide spatial map
+- **Statistics** — point-level onset statistics over a chosen year range
 
-**🔗 Link Timeseries and Map Time Period** — appears when both views are active. When linked, one shared year/year-range selection applies to both. When unlinked, independent time period controls appear for each view.
+**🔗 Link Timeseries and Map Time Period** — appears when both Timeseries and Map are active. When linked, one shared year/year-range selection applies to both. When unlinked, independent time period controls appear for each view.
 
-> Point selection (lat/lon) only appears when the Timeseries view is active — the map always shows the full country and does not require a point.
+> Point selection (lat/lon) only appears when the Timeseries view is active — the map always shows the full country.
 
 ---
 
@@ -115,18 +128,19 @@ For every dataset series shown, the chart always includes:
 - **Daily rainfall** — line + dot at each data point
 - **Wet spell start** — dashed vertical line at the first qualifying wet spell
 - **Onset date** — solid vertical line at the detected onset
-- **Wet-day threshold** — single dotted horizontal line (shared across all datasets, appears once in legend)
+- **Wet-day threshold** — single dotted horizontal line shared across all datasets (appears once in legend)
 
 **Single year mode** — raw daily values for the selected year.
 
 **Year range mode** — mean or median climatology by day-of-year (DOY), with wet spell and onset derived from the climatology curve.
 
-If no wet spell or onset is detected within the search window for a given series, the corresponding line is omitted silently.
+**Clip timeseries to search window** — toggle in the sidebar (under Search window) limits the x-axis to the search window dates, hiding out-of-season data. Can be turned off to show the full year.
+
+If no wet spell or onset is detected within the search window, the corresponding line is omitted silently.
 
 **Interactive legend (Plotly)**
 - Click any item to toggle it on/off
 - Double-click to isolate a single series
-- All series are independently togglable — rainfall, wet spell, onset, and threshold
 
 **Colour scheme**
 
@@ -142,34 +156,37 @@ If no wet spell or onset is detected within the search window for a given series
 
 ### 4. Map Visualisations
 
-All maps are clipped to the Ethiopia boundary using `data/ethiopia.geojson`. An optional `.nc` seasonal mask (`chirps_jjas_seasonal_mask_ethiopia_0p25.nc`) can be toggled per map view.
+All maps are clipped to the Ethiopia boundary. An optional `.nc` seasonal mask can be toggled per map view.
 
 **Map types**
 
 | Type | Description |
 |---|---|
-| Seasonal mean rainfall (JJAS) | Mean daily rainfall over June–September for selected year(s), Blues colormap |
+| Seasonal mean rainfall (JJAS) | Mean daily rainfall over June–September, Blues colormap |
 | Daily rainfall map | Rainfall on a single user-selected date |
-| Wet spell date (DOY) | First wet spell start DOY — single year or multi-year aggregation |
-| Onset date (DOY) | Rainfall onset DOY — single year or multi-year aggregation |
+| Wet spell date | First wet spell start date — single year or multi-year aggregation |
+| Onset date | Rainfall onset date — single year or multi-year aggregation |
 
 **Layout**
-- Maps are displayed in rows of at most 3 columns; overflow wraps to the next row
-- When multiple datasets are selected, individual dataset maps appear first, followed by all pairwise difference maps
-- Difference maps use a diverging colormap (RdBu_r); DOY differences are clipped to ±30 days
-- If two datasets have different resolutions (e.g. CHIRPS 0.05° vs IMERG 0.25°), the finer grid is automatically resampled onto the coarser grid using bilinear interpolation; a caption below the difference map notes which dataset was resampled
+- Maps render in rows of at most 3 columns; overflow wraps to the next row
+- Individual dataset maps appear first, followed by all pairwise difference maps
+- Difference maps use a diverging colormap (RdBu_r); date differences are clipped to ±30 days
+- All datasets are pre-aligned to a common reference grid before differencing, eliminating shape mismatch errors from minor grid offset differences
+
+**Scale toggles** (multi-dataset only)
+- **Shared scale across rainfall maps** — applies the same min/max colour scale to all individual rainfall maps
+- **Shared scale across difference maps** — applies the same diverging scale to all difference maps (rainfall map types only; date difference maps always use a fixed ±30 day scale)
 
 **Year range / aggregation**
 - DOY maps support Mean or Median aggregation across a year range
-- Shared colour scale applied across individual dataset maps when comparing rainfall
 
 ---
 
 ### 5. EMI Station Picker
 
-When EMI Stations are selected, an interactive map of Ethiopia is shown with all 26 station locations marked as red triangles. Station labels are grey by default. Clicking a station selects it — its label turns black and bold. The selected station persists across reruns via Streamlit session state. No station is selected by default; the timeseries view waits until the user clicks one.
+When EMI Stations are selected, an interactive map of Ethiopia is shown with all 43 station locations marked as red triangles. Station labels are grey by default. Clicking a station selects it — its label turns black and bold. The selected station persists across reruns via Streamlit session state. No station is pre-selected; the timeseries view waits until the user clicks one.
 
-The map is styled to match the weather maps: white background, black Ethiopia boundary, labelled lat/lon axes, drawn directly from `data/ethiopia.geojson` with no external tile library.
+The map matches the weather map style: white background, black Ethiopia boundary, labelled lat/lon axes, drawn from `data/ethiopia.geojson` with no external tile library.
 
 ---
 
@@ -184,10 +201,20 @@ All detection parameters are configurable in the sidebar and apply uniformly to 
 | Accumulation threshold | 20.0 mm | Minimum accumulation to trigger a candidate onset |
 | Dry spell length | 7 days | Consecutive dry days that falsify a candidate |
 | Lookahead window | 21 days | Days ahead to check for a disqualifying dry spell |
-| Search start | Jan 1 | Earliest date to search for onset/wet spell |
-| Search end | Dec 31 | Latest date to search for onset/wet spell |
+| Search start | **15 May** | Earliest date to search for onset/wet spell |
+| Search end | **15 Oct** | Latest date to search for onset/wet spell |
 
-Detection runs on raw daily data (single year mode) and on climatology curves (year range mode). Pixel-level DOY maps run detection independently at every grid cell.
+Detection runs on raw daily data (single year mode) and on climatology curves (year range mode). Pixel-level date maps run detection independently at every grid cell. The wet spell walkback is floored at the search window start, preventing spurious early dates when data begins before the search window (e.g. ENACTS starting May 1).
+
+---
+
+### 7. Statistics
+
+The Statistics view (toggled under Select View(s), default on) provides point-level onset analysis over a chosen year range. It requires the Timeseries view to be active so a point is selected. Two charts are available, each independently toggled:
+
+**Onset date scatter** — onset DOY plotted year by year for each dataset at the selected point. A shaded band marks the search window. Years with no detected onset appear as gaps.
+
+**Onset distribution** — probability of onset occurring within each 5-day bin across the search window, computed over the selected year range. Years with no detected onset are excluded from the denominator so probabilities sum to 1. Hover shows the exact date range, probability, and raw count per bin.
 
 ---
 

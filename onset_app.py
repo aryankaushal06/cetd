@@ -1743,8 +1743,7 @@ if selected_grids and not has_station:
         st.divider()
         st.subheader("⑥ Statistics")
         st.caption(
-            "Point-level statistics computed at the selected lat/lon over a chosen year range. "
-            "Uses the same search window as onset detection."
+            "Uses the same search window and onset parameters as the rest of the app."
         )
 
         if not show_ts:
@@ -1770,7 +1769,7 @@ if selected_grids and not has_station:
                 st.stop()
 
             # ── Per-chart toggles ──
-            col_t1, col_t2 = st.columns(2)
+            col_t1, col_t2, col_t3 = st.columns(3)
             with col_t1:
                 show_onset_scatter = st.toggle(
                     "Onset date scatter", value=True, key="show_onset_scatter"
@@ -1779,9 +1778,11 @@ if selected_grids and not has_station:
                 show_onset_dist = st.toggle(
                     "Onset distribution", value=True, key="show_onset_dist"
                 )
+            with col_t3:
+                show_cdf = st.toggle("Rainfall CDF", value=True, key="show_cdf")
 
-            # ── Shared cached functions ──
-            @st.cache_data(show_spinner="Computing onset dates…")
+            # ── Cached functions ──
+            @st.cache_data(show_spinner="Computing onset dates...")
             def compute_onset_series(
                 dataset_key,
                 ds_files,
@@ -1848,6 +1849,83 @@ if selected_grids and not has_station:
                     )
                 return pd.DataFrame(records)
 
+            @st.cache_data(show_spinner="Computing regional onset dates...")
+            def compute_onset_series_region(
+                dataset_key,
+                ds_files,
+                lat_name,
+                lon_name,
+                time_name,
+                y0,
+                y1,
+                lat_min_r,
+                lat_max_r,
+                lon_min_r,
+                lon_max_r,
+                _wet_day_mm,
+                _accum_days,
+                _accum_mm,
+                _dry_spell_days,
+                _lookahead_days,
+                _start_month,
+                _start_day,
+                _end_month,
+                _end_day,
+            ):
+                """Detect onset at every grid cell in the bounding box; return all detections."""
+                import xarray as _xr
+
+                ds = _xr.open_mfdataset(
+                    ds_files,
+                    combine="by_coords",
+                    parallel=True,
+                    chunks={time_name: 365},
+                    engine=None,
+                )
+                ds = maybe_normalize_longitudes(ds, lon_name)
+                rain_var = RAIN_VAR_BY_KEY.get(dataset_key, RAIN_VAR)
+                da_box = ds[rain_var].sel(
+                    {
+                        lat_name: slice(lat_min_r, lat_max_r),
+                        lon_name: slice(lon_min_r, lon_max_r),
+                    }
+                )
+                records = []
+                for yy in range(y0, y1 + 1):
+                    da = da_box.sel(
+                        {time_name: slice(f"{yy}-01-01", f"{yy}-12-31")}
+                    ).compute()
+                    if da.sizes[time_name] == 0:
+                        continue
+                    R = da.values  # (time, lat, lon)
+                    times = pd.to_datetime(da[time_name].values)
+                    for i in range(R.shape[1]):
+                        for j in range(R.shape[2]):
+                            rij = R[:, i, j]
+                            if not np.any(np.isfinite(rij)):
+                                continue
+                            od, _ = detect_onset(
+                                pd.Series(times),
+                                rij,
+                                float(_wet_day_mm),
+                                int(_accum_days),
+                                float(_accum_mm),
+                                int(_dry_spell_days),
+                                int(_lookahead_days),
+                                int(_start_month),
+                                int(_start_day),
+                                int(_end_month),
+                                int(_end_day),
+                            )
+                            if od is not None:
+                                records.append(
+                                    {
+                                        "year": yy,
+                                        "onset_doy": float(pd.Timestamp(od).dayofyear),
+                                    }
+                                )
+                return pd.DataFrame(records)
+
             def doy_to_label(doy):
                 try:
                     return (
@@ -1856,11 +1934,11 @@ if selected_grids and not has_station:
                 except Exception:
                     return str(doy)
 
-            # ── Onset date scatter ──
+            # ── Onset date scatter (always point-based) ──
             if show_onset_scatter:
                 st.markdown("### Onset date scatter")
                 st.caption(
-                    "Onset DOY per year for each dataset at the selected point. "
+                    "Onset DOY per year at the selected point. "
                     "Missing = no onset detected in that year's search window."
                 )
                 fig_sc = go.Figure()
@@ -1946,13 +2024,72 @@ if selected_grids and not has_station:
                 )
                 st.plotly_chart(fig_sc, use_container_width=True)
 
-            # ── Onset distribution ──
+            # ── Onset distribution (point or regional bounding box) ──
             if show_onset_dist:
                 st.markdown("### Onset distribution")
-                st.caption(
-                    "Probability of onset in each 5-day bin. "
-                    "Years with no detected onset are excluded."
+
+                use_region = st.toggle(
+                    "Use bounding box region instead of point",
+                    value=False,
+                    key="dist_use_region",
                 )
+                if use_region:
+                    st.caption(
+                        "Onset is detected at every grid cell within the bounding box. "
+                        "All detections contribute to the distribution, reducing noise "
+                        "compared to a single grid point."
+                    )
+                    rc1, rc2, rc3, rc4 = st.columns(4)
+                    with rc1:
+                        reg_lat_min = st.number_input(
+                            "Lat min",
+                            value=float(np.clip(lat0 - 1, lat_min, lat_max)),
+                            min_value=float(lat_min),
+                            max_value=float(lat_max),
+                            format="%.2f",
+                            step=0.25,
+                            key="reg_lat_min",
+                        )
+                    with rc2:
+                        reg_lat_max = st.number_input(
+                            "Lat max",
+                            value=float(np.clip(lat0 + 1, lat_min, lat_max)),
+                            min_value=float(lat_min),
+                            max_value=float(lat_max),
+                            format="%.2f",
+                            step=0.25,
+                            key="reg_lat_max",
+                        )
+                    with rc3:
+                        reg_lon_min = st.number_input(
+                            "Lon min",
+                            value=float(np.clip(lon0 - 1, lon_min, lon_max)),
+                            min_value=float(lon_min),
+                            max_value=float(lon_max),
+                            format="%.2f",
+                            step=0.25,
+                            key="reg_lon_min",
+                        )
+                    with rc4:
+                        reg_lon_max = st.number_input(
+                            "Lon max",
+                            value=float(np.clip(lon0 + 1, lon_min, lon_max)),
+                            min_value=float(lon_min),
+                            max_value=float(lon_max),
+                            format="%.2f",
+                            step=0.25,
+                            key="reg_lon_max",
+                        )
+                    if reg_lat_max <= reg_lat_min or reg_lon_max <= reg_lon_min:
+                        st.error("Bounding box max must be greater than min.")
+                        st.stop()
+                    dist_label = (
+                        f"{reg_lat_min:.2f}–{reg_lat_max:.2f}°N, "
+                        f"{reg_lon_min:.2f}–{reg_lon_max:.2f}°E"
+                    )
+                else:
+                    dist_label = f"{lat0:.3f}°N, {lon0:.3f}°E"
+
                 sw_start_doy = pd.Timestamp(
                     year=2001, month=int(start_month), day=int(start_day)
                 ).dayofyear
@@ -1967,38 +2104,77 @@ if selected_grids and not has_station:
                     for i in range(len(bin_edges) - 1)
                 ]
                 bin_labels = [doy_to_label(c) for c in bin_centres]
+                n_datasets = len(selected_grids)
+                bar_width = 4.0 / max(n_datasets, 1) * 0.85
 
                 fig_dist = go.Figure()
                 any_dist_data = False
-                for key in selected_grids:
+
+                for d_idx, key in enumerate(selected_grids):
                     la, lo, ti = COORDS_BY_KEY[key]
                     fi = FILES_BY_KEY[key]
                     clr = DATASET_COLORS.get(key, {}).get("rain", "black")
-                    df_sc = compute_onset_series(
-                        key,
-                        tuple(fi),
-                        la,
-                        lo,
-                        ti,
-                        stat_y0,
-                        stat_y1,
-                        lat0,
-                        lon0,
-                        float(wet_day_mm),
-                        int(accum_days),
-                        float(accum_mm),
-                        int(dry_spell_days),
-                        int(lookahead_days),
-                        int(start_month),
-                        int(start_day),
-                        int(end_month),
-                        int(end_day),
-                    )
-                    if df_sc.empty:
-                        continue
-                    detected = df_sc["onset_doy"].dropna()
+
+                    if use_region:
+                        df_r = compute_onset_series_region(
+                            key,
+                            tuple(fi),
+                            la,
+                            lo,
+                            ti,
+                            stat_y0,
+                            stat_y1,
+                            float(reg_lat_min),
+                            float(reg_lat_max),
+                            float(reg_lon_min),
+                            float(reg_lon_max),
+                            float(wet_day_mm),
+                            int(accum_days),
+                            float(accum_mm),
+                            int(dry_spell_days),
+                            int(lookahead_days),
+                            int(start_month),
+                            int(start_day),
+                            int(end_month),
+                            int(end_day),
+                        )
+                        detected = (
+                            df_r["onset_doy"].dropna()
+                            if not df_r.empty
+                            else pd.Series([], dtype=float)
+                        )
+                        denom_note = f"{len(detected)} cell-years"
+                    else:
+                        df_sc2 = compute_onset_series(
+                            key,
+                            tuple(fi),
+                            la,
+                            lo,
+                            ti,
+                            stat_y0,
+                            stat_y1,
+                            lat0,
+                            lon0,
+                            float(wet_day_mm),
+                            int(accum_days),
+                            float(accum_mm),
+                            int(dry_spell_days),
+                            int(lookahead_days),
+                            int(start_month),
+                            int(start_day),
+                            int(end_month),
+                            int(end_day),
+                        )
+                        detected = (
+                            df_sc2["onset_doy"].dropna()
+                            if not df_sc2.empty
+                            else pd.Series([], dtype=float)
+                        )
+                        denom_note = f"{len(detected)} yrs"
+
                     if len(detected) == 0:
                         continue
+
                     counts = np.zeros(len(bin_edges) - 1)
                     for doy in detected:
                         for b in range(len(bin_edges) - 1):
@@ -2008,18 +2184,23 @@ if selected_grids and not has_station:
                     probs = counts / len(detected)
                     hover = [
                         f"{doy_to_label(bin_edges[b])}–{doy_to_label(bin_edges[b+1]-1)}: "
-                        f"P={probs[b]:.2f} ({int(counts[b])}/{len(detected)} yrs)"
+                        f"P={probs[b]:.2f} ({int(counts[b])}/{denom_note})"
                         for b in range(len(bin_edges) - 1)
                     ]
+                    # Offset bars per dataset so grouped bars don't overlap
+                    offset = (d_idx - (n_datasets - 1) / 2) * (4.0 / max(n_datasets, 1))
+                    x_pos = [c + offset for c in bin_centres]
+
                     fig_dist.add_trace(
-                        go.Scatter(
-                            x=bin_labels,
+                        go.Bar(
+                            x=x_pos,
                             y=probs,
-                            mode="lines+markers",
                             name=key,
-                            line=dict(color=clr, width=2),
-                            marker=dict(size=7, color=clr),
+                            width=bar_width,
+                            marker_color=clr,
+                            opacity=0.82,
                             text=hover,
+                            textposition="none",  # hide labels on bars, show on hover only
                             hovertemplate="%{text}<extra>" + key + "</extra>",
                         )
                     )
@@ -2027,25 +2208,118 @@ if selected_grids and not has_station:
 
                 if not any_dist_data:
                     st.info(
-                        "No onset dates detected for any dataset in this year range."
+                        "No onset dates detected for any dataset in this year range and region."
                     )
                 else:
                     fig_dist.update_layout(
-                        title=f"Onset distribution — ({lat0:.3f}°N, {lon0:.3f}°E) — {stat_y0}–{stat_y1}",
-                        xaxis_title="Onset date (5-day bins)",
-                        yaxis_title="Probability",
-                        yaxis=dict(range=[0, None], tickformat=".0%"),
+                        title=f"Onset distribution — {dist_label} — {stat_y0}–{stat_y1}",
+                        xaxis=dict(
+                            title="Onset date (5-day bins)",
+                            tickvals=bin_centres,
+                            ticktext=bin_labels,
+                            tickangle=-30,
+                        ),
+                        yaxis=dict(
+                            title="Probability", range=[0, None], tickformat=".0%"
+                        ),
+                        barmode="overlay",
                         height=440,
-                        legend=dict(orientation="h", y=-0.25),
-                        hovermode="x unified",
+                        legend=dict(orientation="h", y=-0.3),
+                        hovermode="x",
                     )
                     st.plotly_chart(fig_dist, use_container_width=True)
+                    mode_note = (
+                        "aggregated across all grid cells in the bounding box"
+                        if use_region
+                        else "at the selected point"
+                    )
                     st.caption(
-                        f"Probability = fraction of years with detected onset in that window. "
-                        f"{stat_y0}–{stat_y1} ({stat_y1-stat_y0+1} years)."
+                        f"Probability = fraction of detections in each 5-day window, "
+                        f"{mode_note}. {stat_y0}–{stat_y1} ({stat_y1-stat_y0+1} years)."
                     )
 
-# ════════════════════════════════════════════
+            # ── Rainfall CDF ──
+            if show_cdf:
+                st.markdown("### Rainfall CDF")
+                st.caption(
+                    "Empirical CDF of all daily rainfall values (including zero/dry days) "
+                    "at the selected point over the chosen year range."
+                )
+
+                @st.cache_data(show_spinner="Computing rainfall CDF...")
+                def compute_rainfall_cdf(
+                    dataset_key,
+                    ds_files,
+                    lat_name,
+                    lon_name,
+                    time_name,
+                    y0,
+                    y1,
+                    lat0,
+                    lon0,
+                ):
+                    import xarray as _xr
+
+                    ds = _xr.open_mfdataset(
+                        ds_files,
+                        combine="by_coords",
+                        parallel=True,
+                        chunks={time_name: 365},
+                        engine=None,
+                    )
+                    ds = maybe_normalize_longitudes(ds, lon_name)
+                    rain_var = RAIN_VAR_BY_KEY.get(dataset_key, RAIN_VAR)
+                    da = ds[rain_var].sel(
+                        {time_name: slice(f"{y0}-01-01", f"{y1}-12-31")}
+                    )
+                    da = da.sel(
+                        {lat_name: lat0, lon_name: lon0}, method="nearest"
+                    ).compute()
+                    vals = da.values.ravel().astype(float)
+                    return np.sort(vals[np.isfinite(vals)])
+
+                fig_cdf = go.Figure()
+                for key in selected_grids:
+                    la, lo, ti = COORDS_BY_KEY[key]
+                    fi = FILES_BY_KEY[key]
+                    clr = DATASET_COLORS.get(key, {}).get("rain", "black")
+                    vals = compute_rainfall_cdf(
+                        key, tuple(fi), la, lo, ti, stat_y0, stat_y1, lat0, lon0
+                    )
+                    if len(vals) == 0:
+                        continue
+                    cdf_y = np.arange(1, len(vals) + 1) / len(vals)
+                    fig_cdf.add_trace(
+                        go.Scatter(
+                            x=vals,
+                            y=cdf_y,
+                            mode="lines",
+                            name=key,
+                            line=dict(color=clr, width=2),
+                            hovertemplate="%{x:.2f} mm → P=%{y:.3f}<extra>"
+                            + key
+                            + "</extra>",
+                        )
+                    )
+                fig_cdf.add_vline(
+                    x=float(wet_day_mm),
+                    line_dash="dot",
+                    line_color="gray",
+                    annotation_text=f"Wet threshold ({wet_day_mm:g} mm)",
+                    annotation_position="top right",
+                )
+                fig_cdf.update_layout(
+                    title=f"Rainfall CDF — ({lat0:.3f}°N, {lon0:.3f}°E) — {stat_y0}–{stat_y1}",
+                    xaxis_title="Daily rainfall (mm/day)",
+                    yaxis_title="Cumulative probability",
+                    xaxis=dict(range=[0, None]),
+                    yaxis=dict(range=[0, 1]),
+                    height=420,
+                    legend=dict(orientation="h", y=-0.2),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_cdf, use_container_width=True)
+
 # CASE B — EMI Stations only
 # ════════════════════════════════════════════
 elif has_station and not selected_grids:

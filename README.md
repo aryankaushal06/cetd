@@ -79,18 +79,6 @@ CETD/
 
 ---
 
-## Resolution Check
-
-Run `check_resolution.py` from the project root to inspect and compare the spatial resolution, coordinate names, grid dimensions, and time range of all four gridded datasets, plus the EMI station CSV:
-
-```bash
-python check_resolution.py
-```
-
-The script prints a comparison table and flags any resolution mismatches between datasets. All four gridded datasets are expected to share the same 0.25° resolution.
-
----
-
 ## Features
 
 ### 1. Dataset Selection
@@ -215,6 +203,8 @@ The Statistics view (toggled under Select View(s), default on) provides point-le
 **Onset date scatter** — onset DOY plotted year by year for each dataset at the selected point. A shaded band marks the search window. Years with no detected onset appear as gaps.
 
 **Onset distribution** — probability of onset occurring within each 5-day bin across the search window, computed over the selected year range. Years with no detected onset are excluded from the denominator so probabilities sum to 1. Hover shows the exact date range, probability, and raw count per bin.
+
+**Rainfall CDF** — CDF of all daily rainfall values (including dry days) at the selected point over the stats year range, with a vertical line marking the wet-day threshold
 
 ---
 

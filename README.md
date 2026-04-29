@@ -1,6 +1,6 @@
 # CETD — Rainfall Onset Explorer (Ethiopia)
 
-Interactive research tool for detecting and visualising rainfall onset and wet spells across Ethiopia using gridded NetCDF datasets (CHIRPS, ENACTS, IMERG, ERA5) and/or EMI rain gauge station data.
+Interactive research tool for detecting and visualising rainfall onset and wet spells across Ethiopia using gridded NetCDF datasets (CHIRPS, ENACTS, IMERG, ERA5), EMI rain gauge station data, and model forecast output (AIFS, AIFS-ENS, GenCast).
 
 The app supports:
 - Multi-dataset selection (CHIRPS, ENACTS, IMERG, ERA5, EMI Stations — individually or in combination)
@@ -11,7 +11,8 @@ The app supports:
 - Pixel-level onset and wet spell date maps (single year or multi-year aggregation)
 - Pairwise dataset difference maps with automatic grid alignment
 - EMI station timeseries with onset/wet spell detection and interactive station picker map
-- Point-level statistics: onset date scatter and onset probability distribution
+- Point-level statistics: onset date scatter, onset probability distribution, and rainfall CDF
+- Forecast timeseries from AIFS (deterministic), AIFS-ENS (25-member ensemble), and GenCast (32-member ensemble) with full onset/wet spell detection and ensemble fan visualisation
 
 Built for climate onset diagnostics and exploratory research workflows.
 
@@ -22,27 +23,31 @@ Built for climate onset diagnostics and exploratory research workflows.
 ```
 CETD/
 │
-├── app.py                                        # Main Streamlit application
-├── check_resolution.py                           # Inspect and compare resolution of all datasets
-├── run_onset_app.py                              # One-command launcher (creates venv, installs deps)
-├── make_ethiopia_geojson.py                      # Generates Ethiopia boundary GeoJSON
-├── RF_Station_Grid_Format.csv                    # EMI station daily rainfall data (43 stations)
-├── chirps_jjas_seasonal_mask_ethiopia_0p25.nc    # Optional Ethiopia JJAS seasonal mask
+├── app.py                  # Streamlit entry point: sidebar, tabs, all view branches
+├── config.py               # All constants and the OnsetParams frozen dataclass
+├── data.py                 # All I/O: open_folder, load_emi_csv, load_mask, coord helpers
+├── detection.py            # Pure onset algorithm: detect_onset, detect_wet_spell, wet_spell_start
+├── extract.py              # Cached extraction: extract_year, extract_clim, onset_series, rainfall_cdf
+├── maps.py                 # Pixel-level map computation and matplotlib rendering helpers
+├── charts.py               # Plotly figure builders: timeseries, ensemble fan, station map
+├── forecast.py             # Forecast data loading and point extraction for all three models
+│
+├── run_app.py              # One-command launcher (creates .venv, installs deps, launches app)
+├── check_forecasts.py      # Inspect forecast NetCDF structure (dimensions, variables, dates)
 │
 ├── data/
-│   └── ethiopia.geojson                          # Ethiopia boundary (Natural Earth derived)
+│   └── ethiopia.geojson    # Ethiopia boundary (Natural Earth derived)
 │
-├── CHIRPS/
-│   └── *.nc                                      # CHIRPS daily rainfall NetCDF files
-│
-├── ENACTS/
-│   └── *.nc                                      # ENACTS daily rainfall NetCDF files (May–Oct only)
-│
-├── IMERG/
-│   └── imerg_<year>_ethiopia_0p25.nc             # IMERG daily rainfall NetCDF files
-│
-├── ERA5/
-│   └── era5_<year>_ethiopia_0p25.nc              # ERA5 daily rainfall NetCDF files
+├── datasets/
+│   ├── CHIRPS/             # CHIRPS daily rainfall NetCDF files
+│   ├── ENACTS/             # ENACTS daily rainfall NetCDF files (May–Oct only)
+│   ├── IMERG/              # IMERG daily rainfall NetCDF files
+│   ├── ERA5/               # ERA5 daily rainfall NetCDF files
+│   ├── aifs/               # AIFS deterministic forecast NetCDF files (one per year)
+│   ├── aifs_ens/           # AIFS ensemble forecast NetCDF files (one per year)
+│   ├── gencast/            # GenCast ensemble forecast NetCDF files (one per year)
+│   ├── RF_Station_Grid_Format.csv
+│   └── chirps_jjas_seasonal_mask_ethiopia_0p25.nc
 │
 ├── requirements.txt
 └── README.md
@@ -52,7 +57,7 @@ CETD/
 
 ## Data Sources
 
-**Gridded rainfall datasets**
+### Observational gridded datasets
 
 | Dataset | Coord names | Variable | Resolution | Period | Notes |
 |---|---|---|---|---|---|
@@ -65,23 +70,36 @@ CETD/
 
 > **IMERG / ERA5 note:** files produced by CDO remapping can have corrupted time coordinates. The app automatically corrects these at load time by extracting the year from each filename and assigning a clean daily time axis.
 
-**EMI Station data (`RF_Station_Grid_Format.csv`)**
-- Daily rainfall for 43 Ethiopian stations (merged from two source CSVs), 1990–2022
+### EMI Station data (`datasets/RF_Station_Grid_Format.csv`)
+- Daily rainfall for 43 Ethiopian stations, 1990–2022
 - Format: rows = dates (`YYYYMMDD`), columns = station names
 - First rows: `LON` (longitude), `DAILY/LAT` (latitude), then daily data
 - Missing values encoded as `-99` (converted to NaN on load)
 - Station coverage varies — some stations have significant missing data in certain years
 
-**Boundary**
-- Natural Earth Admin-0 countries
-- Extracted via `geopandas`, dissolved to single geometry
+### Forecast datasets
+
+All three forecast models share the same spatial grid (0.25°, lat 3–15°N, lon 33–48°E) and the same time structure: 23 initialisation dates from May 1 to July 31 per year, spaced roughly every 4–6 days.
+
+| Model | Variable | Lead time | Members | Period | Notes |
+|---|---|---|---|---|---|
+| AIFS | `tp` (mm) | 47 days (day 0–46) | 1 (deterministic) | 2000–2025 | `day` coordinate is 0-indexed |
+| AIFS-ENS | `tp` (mm) | 47 days (day 0–46) | 25 (`number` 0–24) | 2000–2024 | |
+| GenCast | `tp` | 45 days (day 1–45) | 32 (`number` 1–32) | 2003–2024 (missing 2006) | `day` coordinate is 1-indexed; no units attribute |
+
+> **GenCast note at long lead times:** GenCast can produce very high precipitation values (50–70+ mm/day) beyond ~day 20 for Ethiopian locations, particularly during JJAS. This is likely a calibration bias of the global ML model rather than a real signal. Interpret long-range GenCast forecasts with caution.
+
+### Boundary
+- Natural Earth Admin-0 countries, dissolved to single geometry
 - Saved locally as `data/ethiopia.geojson`
 
 ---
 
 ## Features
 
-### 1. Dataset Selection
+### Observations tab
+
+#### 1. Dataset Selection
 
 The app supports any combination of the four gridded datasets plus EMI Stations:
 
@@ -96,7 +114,7 @@ When datasets with different temporal ranges are combined, the year selector is 
 
 ---
 
-### 2. Select View(s)
+#### 2. Select View(s)
 
 When one or more grid datasets are selected (without EMI Stations), three views can be independently toggled:
 
@@ -110,19 +128,19 @@ When one or more grid datasets are selected (without EMI Stations), three views 
 
 ---
 
-### 3. Timeseries Explorer
+#### 3. Timeseries Explorer
 
 For every dataset series shown, the chart always includes:
 - **Daily rainfall** — line + dot at each data point
 - **Wet spell start** — dashed vertical line at the first qualifying wet spell
 - **Onset date** — solid vertical line at the detected onset
-- **Wet-day threshold** — single dotted horizontal line shared across all datasets (appears once in legend)
+- **Wet-day threshold** — single dotted horizontal line shared across all datasets
 
 **Single year mode** — raw daily values for the selected year.
 
 **Year range mode** — mean or median climatology by day-of-year (DOY), with wet spell and onset derived from the climatology curve.
 
-**Clip timeseries to search window** — toggle in the sidebar (under Search window) limits the x-axis to the search window dates, hiding out-of-season data. Can be turned off to show the full year.
+**Clip timeseries to search window** — sidebar toggle limits the x-axis to the search window dates. Can be turned off to show the full year.
 
 If no wet spell or onset is detected within the search window, the corresponding line is omitted silently.
 
@@ -142,7 +160,7 @@ If no wet spell or onset is detected within the search window, the corresponding
 
 ---
 
-### 4. Map Visualisations
+#### 4. Map Visualisations
 
 All maps are clipped to the Ethiopia boundary. An optional `.nc` seasonal mask can be toggled per map view.
 
@@ -165,22 +183,84 @@ All maps are clipped to the Ethiopia boundary. An optional `.nc` seasonal mask c
 - **Shared scale across rainfall maps** — applies the same min/max colour scale to all individual rainfall maps
 - **Shared scale across difference maps** — applies the same diverging scale to all difference maps (rainfall map types only; date difference maps always use a fixed ±30 day scale)
 
-**Year range / aggregation**
-- DOY maps support Mean or Median aggregation across a year range
+---
+
+#### 5. EMI Station Picker
+
+When EMI Stations are selected, an interactive map of Ethiopia is shown with all 43 station locations marked as red triangles. Clicking a station selects it — its label turns black and bold. The selected station persists across reruns via Streamlit session state.
 
 ---
 
-### 5. EMI Station Picker
+#### 6. Statistics
 
-When EMI Stations are selected, an interactive map of Ethiopia is shown with all 43 station locations marked as red triangles. Station labels are grey by default. Clicking a station selects it — its label turns black and bold. The selected station persists across reruns via Streamlit session state. No station is pre-selected; the timeseries view waits until the user clicks one.
+The Statistics view provides point-level onset analysis over a chosen year range. Three charts are available, each independently toggled:
 
-The map matches the weather map style: white background, black Ethiopia boundary, labelled lat/lon axes, drawn from `data/ethiopia.geojson` with no external tile library.
+**Onset date scatter** — onset DOY plotted year by year for each dataset at the selected point. A shaded band marks the search window. Years with no detected onset appear as gaps.
+
+**Onset distribution** — probability of onset occurring within each 5-day bin across the search window, computed over the selected year range. A bounding-box region mode is also available: onset is detected at every grid cell in the box and all detections are pooled together. Hover shows the exact date range, probability, and raw count per bin.
+
+**Rainfall CDF** — empirical CDF of all daily rainfall values (including dry days) at the selected point over the stats year range, with a vertical line marking the wet-day threshold.
 
 ---
 
-### 6. Onset & Wet Spell Detection
+### Forecasts tab
 
-All detection parameters are configurable in the sidebar and apply uniformly to all datasets and views.
+#### 7. Forecast Model Selection
+
+Select one or more forecast models (AIFS, AIFS-ENS, GenCast). The year selector is automatically limited to years available in all selected models.
+
+---
+
+#### 8. Initialisation Date Selection
+
+Within the selected year, each model provides 23 initialisation dates from May 1 to July 31. Multiple initialisation dates can be selected simultaneously — each produces its own set of traces on the chart, allowing comparison of how forecasts evolve as the init date moves later into the season.
+
+> A warning is shown if more than 5 model × init combinations are selected with individual members displayed, as this can slow rendering.
+
+---
+
+#### 9. Forecast Timeseries
+
+The x-axis represents the forecast **valid date** (initialisation date + lead day). Each model × init date combination adds:
+
+**Deterministic (AIFS)**
+- Single rainfall line
+- Wet spell start (dashed vertical line) and onset date (solid vertical line) derived from the forecast timeseries
+
+**Ensemble (AIFS-ENS, GenCast)**
+- **Individual member traces** (faded, toggleable) — one thin line per ensemble member
+- **P10–P90 shaded band** — ensemble spread at each valid date
+- **Median line** — bold line through the ensemble median
+- **Per-member wet spell / onset markers** — faded vertical lines for every member that produces a detection, plus a bold median marker
+- Wet-day threshold horizontal line
+
+The search window clip toggle (sidebar) applies to the forecast chart x-axis as well.
+
+**Colour scheme**
+
+| Model | Rainfall / median | Fan | Wet spell | Onset |
+|---|---|---|---|---|
+| AIFS | Orange | — | Dark orange | Dark brown-orange |
+| AIFS-ENS | Purple | Light purple | Dark purple | Deep purple |
+| GenCast | Green | Light green | Dark green | Very dark green |
+
+---
+
+#### 10. Onset / Wet Spell Summary Table
+
+Below the forecast chart, a table summarises detection results for every model × init date combination:
+
+| Column | Deterministic | Ensemble |
+|---|---|---|
+| Wet spell start | Detected date or — | Median across members |
+| Onset date | Detected date or — | Median across members |
+| Members w/ onset | — | N / total members |
+
+---
+
+### Onset & Wet Spell Detection (all tabs)
+
+All detection parameters are configurable in the sidebar and apply uniformly across all datasets, views, and forecast models.
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -192,38 +272,28 @@ All detection parameters are configurable in the sidebar and apply uniformly to 
 | Search start | **15 May** | Earliest date to search for onset/wet spell |
 | Search end | **15 Oct** | Latest date to search for onset/wet spell |
 
-Detection runs on raw daily data (single year mode) and on climatology curves (year range mode). Pixel-level date maps run detection independently at every grid cell. The wet spell walkback is floored at the search window start, preventing spurious early dates when data begins before the search window (e.g. ENACTS starting May 1).
-
----
-
-### 7. Statistics
-
-The Statistics view (toggled under Select View(s), default on) provides point-level onset analysis over a chosen year range. It requires the Timeseries view to be active so a point is selected. Two charts are available, each independently toggled:
-
-**Onset date scatter** — onset DOY plotted year by year for each dataset at the selected point. A shaded band marks the search window. Years with no detected onset appear as gaps.
-
-**Onset distribution** — probability of onset occurring within each 5-day bin across the search window, computed over the selected year range. Years with no detected onset are excluded from the denominator so probabilities sum to 1. Hover shows the exact date range, probability, and raw count per bin.
-
-**Rainfall CDF** — CDF of all daily rainfall values (including dry days) at the selected point over the stats year range, with a vertical line marking the wet-day threshold
+Detection runs on raw daily data (single year mode), climatology curves (year range mode), pixel grids (map mode), and individual forecast member timeseries (forecast mode). The wet spell walkback is floored at the search window start, preventing spurious early dates.
 
 ---
 
 ## Running the Project
 
-From the project root:
-
 ```bash
-python run_onset_app.py
+python run_app.py
 # or
-python3 run_onset_app.py
+python3 run_app.py
 ```
 
-This creates a virtual environment, installs all dependencies, and launches the Streamlit app automatically.
-
-To run manually after setup:
+This creates a `.venv` virtual environment, installs all dependencies, and launches the Streamlit app automatically. Run it once after cloning; subsequent launches can use:
 
 ```bash
-streamlit run app.py
+.venv/bin/streamlit run app.py
+```
+
+To inspect the structure of the forecast NetCDF files before integrating new data:
+
+```bash
+python check_forecasts.py
 ```
 
 ---
